@@ -13,6 +13,7 @@
     "trigger:login": "trigger login"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.120.0",
     "@supabase/supabase-js": "^2.112.3",
     "@trigger.dev/sdk": "4.5.12",
     "apify-client": "^2.25.0",
