@@ -1,11 +1,17 @@
 /**
- * Persist an AI qualification into the existing `enrichment_runs` table (one row
- * per provider operation, per the Master Plan). Optionally records the score on
- * companies.icp_score. NEVER changes companies.status — promotion review→approved
- * is a human decision.
+ * Persist AI qualification runs into `enrichment_runs`.
+ *
+ * Stage 5 additions: gateway, task_type, latency_ms, cost_usd, error_message,
+ * cache_hit, escalated_from_run_id.  The `buildQualificationRow` and
+ * `buildEscalationAttemptRow` helpers are exported so tests can verify the
+ * field-mapping logic without hitting the database.
  */
 import type { CompanyRecord, QualificationInput, QualificationResult } from "../domain/types";
+import type { EscalationAttempt, EscalationResult } from "../providers/ai/escalation-router";
+import type { TaskType } from "../providers/ai/model-router";
 import { getSupabaseAdmin } from "./supabase";
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
 
 /** Compact, provider-agnostic snapshot of what the AI saw (for provenance). */
 function inputSnapshot(input: QualificationInput) {
@@ -25,13 +31,143 @@ function inputSnapshot(input: QualificationInput) {
   };
 }
 
+/**
+ * Extracts the gateway name from a provider id.
+ * Provider ids follow the "gateway:model" format, e.g.:
+ *   "anthropic-direct:claude-opus-4-8"  → "anthropic-direct"
+ *   "openrouter:anthropic/claude-haiku" → "openrouter"
+ * Returns null for ids that don't match the pattern.
+ */
+export function extractGateway(providerId: string): string | null {
+  const colonIdx = providerId.indexOf(":");
+  if (colonIdx <= 0) return null;
+  return providerId.slice(0, colonIdx);
+}
+
+// ── Options ───────────────────────────────────────────────────────────────────
+
 export interface StoreQualificationOptions {
   /** Also write the score to companies.icp_score (does NOT touch status). */
   updateIcpScore?: boolean;
   /** Tag this call to a client for per-client cost roll-up. */
   clientId?: string;
+  // Stage 5 observability fields:
+  /** AI gateway used — "anthropic-direct" | "openrouter". */
+  gateway?: string;
+  /** Routing task type — "icp_qualification" | "personalization" | … */
+  taskType?: string;
+  /** Wall-clock ms from AI request start to response receipt. */
+  latencyMs?: number;
+  /** Estimated cost in USD (tokens × model price). Null if unavailable. */
+  costUsd?: number;
+  /** Human-readable failure reason. Null on successful runs. */
+  errorMessage?: string;
+  /** FK to the cheaper attempt this run escalated from. */
+  escalatedFromRunId?: string;
 }
 
+export interface StoreEscalationOptions {
+  /** Tag all attempt rows to a client. */
+  clientId?: string;
+  /** Also write the score to companies.icp_score (does NOT touch status). */
+  updateIcpScore?: boolean;
+  /** Total wall-clock ms for the entire escalation (across all attempts). */
+  totalLatencyMs?: number;
+}
+
+// ── Pure row-builders (exported for testing) ──────────────────────────────────
+
+/**
+ * Builds the DB row dict for a single qualification result.
+ * Pure — no I/O; safe to test without a DB.
+ */
+export function buildQualificationRow(
+  companyId: string,
+  input: QualificationInput,
+  result: QualificationResult,
+  startedAt: string,
+  opts: StoreQualificationOptions = {},
+): Record<string, unknown> {
+  return {
+    company_id: companyId,
+    provider: result.model,
+    operation: "ai_qualification",
+    status: opts.errorMessage ? "failed" : "completed",
+    input_data: inputSnapshot(input),
+    output_data: result,
+    started_at: startedAt,
+    completed_at: result.qualifiedAt,
+    input_tokens: result.inputTokens ?? null,
+    output_tokens: result.outputTokens ?? null,
+    client_id: opts.clientId ?? null,
+    // Stage 5 fields:
+    gateway: opts.gateway ?? null,
+    task_type: opts.taskType ?? null,
+    latency_ms: opts.latencyMs ?? null,
+    cost_usd: opts.costUsd ?? null,
+    error_message: opts.errorMessage ?? null,
+    cache_hit: null,               // reserved — caching not yet implemented
+    escalated_from_run_id: opts.escalatedFromRunId ?? null,
+  };
+}
+
+/**
+ * Builds a DB row for a single attempt within an escalation chain.
+ * Pure — no I/O; safe to test without a DB.
+ *
+ * @param attempt          The attempt record from EscalationResult.attempts.
+ * @param finalResult      The QualificationResult accepted at this attempt's tier.
+ *                         Only meaningful (and only stored in output_data) for the
+ *                         final accepted attempt; intermediate attempts store null.
+ * @param isFinalAttempt   True only for the last attempt (the one that was accepted).
+ * @param escalatedFromRunId  The DB-generated id of the previous attempt's row.
+ */
+export function buildEscalationAttemptRow(
+  companyId: string,
+  input: QualificationInput,
+  attempt: EscalationAttempt,
+  finalResult: QualificationResult | null,
+  isFinalAttempt: boolean,
+  opts: {
+    clientId?: string;
+    taskType?: string;
+    escalatedFromRunId?: string;
+    startedAt: string;
+    completedAt?: string;
+    latencyMs?: number;
+  },
+): Record<string, unknown> {
+  const gateway = extractGateway(attempt.providerId);
+  return {
+    company_id: companyId,
+    provider: attempt.model,
+    operation: "ai_qualification",
+    status: isFinalAttempt ? "completed" : "escalated",
+    input_data: inputSnapshot(input),
+    // Only the final attempt stores the full result in output_data.
+    output_data: isFinalAttempt ? (finalResult ?? null) : null,
+    started_at: opts.startedAt,
+    completed_at: isFinalAttempt ? (opts.completedAt ?? null) : null,
+    input_tokens: attempt.inputTokens ?? null,
+    output_tokens: attempt.outputTokens ?? null,
+    client_id: opts.clientId ?? null,
+    // Stage 5 fields:
+    gateway,
+    task_type: opts.taskType ?? null,
+    latency_ms: isFinalAttempt ? (opts.latencyMs ?? null) : null,
+    cost_usd: null,         // per-attempt cost requires model price table; deferred
+    error_message: null,
+    cache_hit: null,
+    escalated_from_run_id: opts.escalatedFromRunId ?? null,
+  };
+}
+
+// ── Async persistence functions ───────────────────────────────────────────────
+
+/**
+ * Persists a single AI qualification result.
+ * Pass gateway, taskType, latencyMs etc. in opts for full observability.
+ */
 export async function storeQualification(
   companyId: string,
   input: QualificationInput,
@@ -40,22 +176,11 @@ export async function storeQualification(
   opts: StoreQualificationOptions = {},
 ): Promise<{ enrichmentRunId: string }> {
   const db = getSupabaseAdmin();
+  const row = buildQualificationRow(companyId, input, result, startedAt, opts);
 
   const { data, error } = await db
     .from("enrichment_runs")
-    .insert({
-      company_id: companyId,
-      provider: result.model,
-      operation: "ai_qualification",
-      status: "completed",
-      input_data: inputSnapshot(input),
-      output_data: result,
-      started_at: startedAt,
-      completed_at: result.qualifiedAt,
-      input_tokens: result.inputTokens ?? null,
-      output_tokens: result.outputTokens ?? null,
-      client_id: opts.clientId ?? null,
-    })
+    .insert(row)
     .select("id")
     .single();
   if (error) throw new Error(`storeQualification failed: ${error.message}`);
@@ -69,4 +194,71 @@ export async function storeQualification(
   }
 
   return { enrichmentRunId: (data as { id: string }).id };
+}
+
+/**
+ * Persists an EscalationResult as a linked chain of enrichment_run rows —
+ * one row per attempt.  Rows are linked via escalated_from_run_id so the
+ * full escalation path is queryable.
+ *
+ * Chain layout (example: low → medium → high):
+ *   [0] low  attempt  — status: "escalated", escalated_from_run_id: null
+ *   [1] mid  attempt  — status: "escalated", escalated_from_run_id: row[0].id
+ *   [2] high attempt  — status: "completed", escalated_from_run_id: row[1].id
+ *
+ * Returns all row IDs in attempt order, plus the final (accepted) run ID.
+ */
+export async function storeEscalationResult(
+  companyId: string,
+  input: QualificationInput,
+  escalation: EscalationResult,
+  taskType: TaskType,
+  startedAt: string,
+  opts: StoreEscalationOptions = {},
+): Promise<{ runIds: string[]; finalRunId: string }> {
+  const db = getSupabaseAdmin();
+  const runIds: string[] = [];
+  const totalAttempts = escalation.attempts.length;
+
+  for (let i = 0; i < totalAttempts; i++) {
+    const attempt = escalation.attempts[i];
+    const isFinal = i === totalAttempts - 1;
+
+    const row = buildEscalationAttemptRow(
+      companyId,
+      input,
+      attempt,
+      isFinal ? escalation.result : null,
+      isFinal,
+      {
+        clientId: opts.clientId,
+        taskType,
+        escalatedFromRunId: i > 0 ? runIds[i - 1] : undefined,
+        startedAt,
+        completedAt: isFinal ? escalation.result.qualifiedAt : undefined,
+        latencyMs: isFinal ? opts.totalLatencyMs : undefined,
+      },
+    );
+
+    const { data, error } = await db
+      .from("enrichment_runs")
+      .insert(row)
+      .select("id")
+      .single();
+    if (error) {
+      throw new Error(`storeEscalationResult failed at attempt ${i}: ${error.message}`);
+    }
+
+    runIds.push((data as { id: string }).id);
+  }
+
+  if (opts.updateIcpScore) {
+    const { error: upErr } = await db
+      .from("companies")
+      .update({ icp_score: escalation.result.score, updated_at: new Date().toISOString() })
+      .eq("id", companyId);
+    if (upErr) throw new Error(`icp_score update failed: ${upErr.message}`);
+  }
+
+  return { runIds, finalRunId: runIds[runIds.length - 1] };
 }
