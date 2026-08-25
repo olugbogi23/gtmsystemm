@@ -88,4 +88,7 @@ export interface QualificationResult {
   /** Provenance of the judgment. */
   model: string;
   qualifiedAt: string;
+  /** Token usage — populated by providers that expose usage (e.g. OpenRouter). */
+  inputTokens?: number;
+  outputTokens?: number;
 }

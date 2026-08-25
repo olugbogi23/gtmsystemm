@@ -34,8 +34,8 @@ export const ENV_KEYS = {
   supabasePublishableKey: "SUPABASE_PUBLISHABLE_KEY",
   /** Personal Access Token (sbp_…) for the Management API — enables DDL. */
   supabaseAccessToken: "SUPABASE_ACCESS_TOKEN",
-  // AI
-  anthropicApiKey: "ANTHROPIC_API_KEY",
+  // AI — routed through OpenRouter (single key covers all models)
+  openrouterApiKey: "OPENROUTER_API_KEY",
   openaiApiKey: "OPENAI_API_KEY",
   // Lead-source / research providers
   apifyToken: "APIFY_API_TOKEN",

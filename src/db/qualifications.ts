@@ -28,6 +28,8 @@ function inputSnapshot(input: QualificationInput) {
 export interface StoreQualificationOptions {
   /** Also write the score to companies.icp_score (does NOT touch status). */
   updateIcpScore?: boolean;
+  /** Tag this call to a client for per-client cost roll-up. */
+  clientId?: string;
 }
 
 export async function storeQualification(
@@ -43,13 +45,16 @@ export async function storeQualification(
     .from("enrichment_runs")
     .insert({
       company_id: companyId,
-      provider: result.model, // e.g. "claude-opus-4-8"
+      provider: result.model,
       operation: "ai_qualification",
       status: "completed",
       input_data: inputSnapshot(input),
       output_data: result,
       started_at: startedAt,
       completed_at: result.qualifiedAt,
+      input_tokens: result.inputTokens ?? null,
+      output_tokens: result.outputTokens ?? null,
+      client_id: opts.clientId ?? null,
     })
     .select("id")
     .single();

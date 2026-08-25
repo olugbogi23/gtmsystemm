@@ -10,7 +10,7 @@
 import "../config/env";
 import { getSupabaseAdmin } from "../db/supabase";
 import { storeQualification } from "../db/qualifications";
-import { ClaudeProvider } from "../providers/ai/claude";
+import { ModelRouter } from "../providers/ai/model-router";
 import type { CompanyRecord, QualificationInput } from "../domain/types";
 
 const listId = process.argv[2];
@@ -29,9 +29,9 @@ const ICP: QualificationInput["icp"] = {
     "Independent, single-location specialty coffee shops in the Austin metro. Chains and franchises are a weaker fit.",
 };
 
-const provider = new ClaudeProvider();
+const provider = ModelRouter.route("icp_qualification");
 if (!provider.isConfigured()) {
-  console.error("ANTHROPIC_API_KEY is not set in .env — cannot run qualification.");
+  console.error("OPENROUTER_API_KEY is not set in .env — cannot run qualification.");
   process.exit(1);
 }
 

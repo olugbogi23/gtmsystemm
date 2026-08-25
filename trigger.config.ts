@@ -8,9 +8,9 @@ export default defineConfig({
   // under skills/ so nothing in the existing pipeline is treated as a task.
   dirs: ["./trigger"],
   build: {
-    // apify-client pulls in undici, whose ProxyAgent breaks when esbuild bundles
-    // it ("ProxyAgent is not a constructor"). Load it from node_modules instead.
-    external: ["apify-client"],
+    // apify-client and openai both pull in undici/node-fetch variants that break
+    // when esbuild bundles them. Load from node_modules at runtime instead.
+    external: ["apify-client", "openai"],
   },
   retries: {
     // No retries while developing locally so failures surface immediately.
