@@ -1,6 +1,7 @@
 import type { AIProvider } from "../types";
 import type { QualificationInput, QualificationResult } from "../../domain/types";
 import { ModelRouter, type TaskType, type ComplexityHint } from "./model-router";
+import { executeQualification } from "./executor";
 
 /** Fixed progression — escalation always moves left to right. */
 const TIER_ORDER: readonly ComplexityHint[] = ["low", "medium", "high"] as const;
@@ -92,6 +93,13 @@ export interface EscalationAttempt {
   outputTokens: number;
   /** True if this attempt triggered escalation to the next tier. */
   escalated: boolean;
+  // Stage 6 — execution-time cost and timing (set by the executor, not the caller):
+  /** Wall-clock milliseconds for this attempt only. */
+  latencyMs: number;
+  /** Computed USD cost for this attempt. Null when model is not in pricing registry. */
+  costUsd: number | null;
+  /** Pricing registry key used ("gateway:model"), or null when gateway unresolvable. */
+  priceKey: string | null;
 }
 
 export interface EscalationResult {
@@ -109,6 +117,11 @@ export interface EscalationResult {
   finalProviderId: string;
   /** True if at least one escalation occurred (attempts.length > 1). */
   escalated: boolean;
+  /**
+   * Total USD cost across ALL attempts.
+   * Null when ANY attempt has an unknown model (cost incomplete — not zero).
+   */
+  totalCostUsd: number | null;
 }
 
 // ── Internal ──────────────────────────────────────────────────────────────────
@@ -178,20 +191,28 @@ export class EscalationRouter {
     const attempts: EscalationAttempt[] = [];
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
+    let totalCostUsd: number | null = 0;
 
     for (let i = startIdx; i <= maxIdx; i++) {
       const tier = TIER_ORDER[i];
       const isMaxTier = i === maxIdx;
 
       const provider = providerFactory(config.taskType, tier);
-      const result = await provider.qualifyCompany(input);
+      const execution = await executeQualification(provider, input);
 
-      const confidence = sanitizeConfidence(result.confidence);
-      const inputTokens = result.inputTokens ?? 0;
-      const outputTokens = result.outputTokens ?? 0;
+      const confidence = sanitizeConfidence(execution.result.confidence);
+      const inputTokens = execution.inputTokens;
+      const outputTokens = execution.outputTokens;
 
       totalInputTokens += inputTokens;
       totalOutputTokens += outputTokens;
+
+      // Accumulate total cost — null as soon as any attempt has unknown pricing.
+      if (execution.costUsd !== null && totalCostUsd !== null) {
+        totalCostUsd += execution.costUsd;
+      } else {
+        totalCostUsd = null;
+      }
 
       const meetsThreshold = confidence !== null && confidence >= config.confidenceThreshold;
       const willEscalate = !meetsThreshold && !isMaxTier;
@@ -199,22 +220,26 @@ export class EscalationRouter {
       attempts.push({
         tier,
         providerId: provider.id,
-        model: result.model,
+        model: execution.result.model,
         confidence,
         inputTokens,
         outputTokens,
         escalated: willEscalate,
+        latencyMs: execution.latencyMs,
+        costUsd: execution.costUsd,
+        priceKey: execution.priceKey,
       });
 
       if (!willEscalate) {
         return {
-          result,
+          result: execution.result,
           attempts,
           totalInputTokens,
           totalOutputTokens,
           finalTier: tier,
           finalProviderId: provider.id,
           escalated: attempts.length > 1,
+          totalCostUsd,
         };
       }
       // Loop continues to next tier.

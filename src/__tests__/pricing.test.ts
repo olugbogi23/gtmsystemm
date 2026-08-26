@@ -444,7 +444,9 @@ test("buildQualificationRow: cost_usd auto-computed for openrouter model", () =>
 
 // ── Integration: buildEscalationAttemptRow per-attempt cost ──────────────────
 
-test("buildEscalationAttemptRow: auto-computes cost from attempt.providerId", () => {
+test("buildEscalationAttemptRow: stores pre-computed costUsd from attempt", () => {
+  // The executor pre-computes cost; the row builder passes it through.
+  // Haiku 1M in / 1M out: $0.80 + $4.00 = $4.80
   const attempt: EscalationAttempt = {
     tier: "low",
     providerId: "anthropic-direct:claude-haiku-4-5-20251001",
@@ -453,16 +455,20 @@ test("buildEscalationAttemptRow: auto-computes cost from attempt.providerId", ()
     inputTokens: 1_000_000,
     outputTokens: 1_000_000,
     escalated: true,
+    latencyMs: 0,
+    costUsd: 4.80,
+    priceKey: "anthropic-direct:claude-haiku-4-5-20251001",
   };
   const row = buildEscalationAttemptRow(
     COMPANY_ID, DUMMY_INPUT, attempt, null, false,
     { startedAt: STARTED_AT },
   );
-  // Haiku: $0.80 + $4.00 = $4.80
   assert.ok(Math.abs((row.cost_usd as number) - 4.80) < 1e-8);
 });
 
-test("buildEscalationAttemptRow: openrouter attempt cost auto-computed", () => {
+test("buildEscalationAttemptRow: stores openrouter pre-computed cost from attempt", () => {
+  // Opus via openrouter: 5k input + 1k output
+  // (5000/1M * 15) + (1000/1M * 75) = 0.075 + 0.075 = 0.15
   const attempt: EscalationAttempt = {
     tier: "high",
     providerId: "openrouter:anthropic/claude-opus-4-8",
@@ -471,18 +477,19 @@ test("buildEscalationAttemptRow: openrouter attempt cost auto-computed", () => {
     inputTokens: 5_000,
     outputTokens: 1_000,
     escalated: false,
+    latencyMs: 0,
+    costUsd: 0.15,
+    priceKey: "openrouter:anthropic/claude-opus-4-8",
   };
   const result = makeResult({ model: "anthropic/claude-opus-4-8" });
   const row = buildEscalationAttemptRow(
     COMPANY_ID, DUMMY_INPUT, attempt, result, true,
     { startedAt: STARTED_AT, completedAt: result.qualifiedAt },
   );
-  // Opus via openrouter: same price, 5k input + 1k output
-  // (5000/1M * 15) + (1000/1M * 75) = 0.075 + 0.075 = 0.15
   assert.ok(Math.abs((row.cost_usd as number) - 0.15) < 1e-10);
 });
 
-test("buildEscalationAttemptRow: cost is null for unknown model", () => {
+test("buildEscalationAttemptRow: null costUsd on attempt stores null in row", () => {
   const attempt: EscalationAttempt = {
     tier: "low",
     providerId: "some-gateway:unknown-model",
@@ -491,6 +498,9 @@ test("buildEscalationAttemptRow: cost is null for unknown model", () => {
     inputTokens: 1_000,
     outputTokens: 500,
     escalated: false,
+    latencyMs: 0,
+    costUsd: null,
+    priceKey: null,
   };
   const row = buildEscalationAttemptRow(
     COMPANY_ID, DUMMY_INPUT, attempt, null, true,
@@ -499,7 +509,14 @@ test("buildEscalationAttemptRow: cost is null for unknown model", () => {
   assert.equal(row.cost_usd, null);
 });
 
-test("buildEscalationAttemptRow: each attempt in a chain has its own correct cost", () => {
+test("buildEscalationAttemptRow: each attempt in a chain carries its own pre-computed cost", () => {
+  // Haiku: (200/1M * 0.80) + (80/1M * 4.00) = 0.00000016 + 0.00000032 = 0.00000048
+  const haikuExpected = (200 / 1_000_000) * 0.80 + (80 / 1_000_000) * 4.00;
+  // Sonnet: (500/1M * 3.00) + (150/1M * 15.00) = 0.0000015 + 0.00000225 = 0.00000375
+  const sonnetExpected = (500 / 1_000_000) * 3.00 + (150 / 1_000_000) * 15.00;
+  // Opus: (1200/1M * 15.00) + (400/1M * 75.00) = 0.000018 + 0.00003 = 0.000048
+  const opusExpected = (1_200 / 1_000_000) * 15.00 + (400 / 1_000_000) * 75.00;
+
   const attempts: EscalationAttempt[] = [
     {
       tier: "low",
@@ -509,6 +526,9 @@ test("buildEscalationAttemptRow: each attempt in a chain has its own correct cos
       inputTokens: 200,
       outputTokens: 80,
       escalated: true,
+      latencyMs: 0,
+      costUsd: haikuExpected,
+      priceKey: "anthropic-direct:claude-haiku-4-5-20251001",
     },
     {
       tier: "medium",
@@ -518,6 +538,9 @@ test("buildEscalationAttemptRow: each attempt in a chain has its own correct cos
       inputTokens: 500,
       outputTokens: 150,
       escalated: true,
+      latencyMs: 0,
+      costUsd: sonnetExpected,
+      priceKey: "anthropic-direct:claude-sonnet-4-6",
     },
     {
       tier: "high",
@@ -527,6 +550,9 @@ test("buildEscalationAttemptRow: each attempt in a chain has its own correct cos
       inputTokens: 1_200,
       outputTokens: 400,
       escalated: false,
+      latencyMs: 0,
+      costUsd: opusExpected,
+      priceKey: "anthropic-direct:claude-opus-4-8",
     },
   ];
 
@@ -539,21 +565,13 @@ test("buildEscalationAttemptRow: each attempt in a chain has its own correct cos
     );
   });
 
-  // Haiku: (200/1M * 0.80) + (80/1M * 4.00) = 0.00000016 + 0.00000032 = 0.00000048
-  const haikuExpected = (200 / 1_000_000) * 0.80 + (80 / 1_000_000) * 4.00;
   assert.ok(Math.abs((rows[0].cost_usd as number) - haikuExpected) < 1e-12);
-
-  // Sonnet: (500/1M * 3.00) + (150/1M * 15.00) = 0.0000015 + 0.00000225 = 0.00000375
-  const sonnetExpected = (500 / 1_000_000) * 3.00 + (150 / 1_000_000) * 15.00;
   assert.ok(Math.abs((rows[1].cost_usd as number) - sonnetExpected) < 1e-12);
-
-  // Opus: (1200/1M * 15.00) + (400/1M * 75.00) = 0.000018 + 0.00003 = 0.000048
-  const opusExpected = (1_200 / 1_000_000) * 15.00 + (400 / 1_000_000) * 75.00;
   assert.ok(Math.abs((rows[2].cost_usd as number) - opusExpected) < 1e-12);
 });
 
-test("buildEscalationAttemptRow: cost_usd is null when tokens are 0 and model is valid", () => {
-  // Zero tokens → zero cost (not null) — valid because the call happened
+test("buildEscalationAttemptRow: zero costUsd stored correctly (not null)", () => {
+  // Zero tokens → executor computes zero cost (not null); row builder stores it as 0.
   const attempt: EscalationAttempt = {
     tier: "low",
     providerId: "anthropic-direct:claude-haiku-4-5-20251001",
@@ -562,12 +580,14 @@ test("buildEscalationAttemptRow: cost_usd is null when tokens are 0 and model is
     inputTokens: 0,
     outputTokens: 0,
     escalated: false,
+    latencyMs: 0,
+    costUsd: 0,
+    priceKey: "anthropic-direct:claude-haiku-4-5-20251001",
   };
   const row = buildEscalationAttemptRow(
     COMPANY_ID, DUMMY_INPUT, attempt, null, true,
     { startedAt: STARTED_AT },
   );
-  // Zero tokens → zero cost, not null
   assert.equal(row.cost_usd, 0);
 });
 

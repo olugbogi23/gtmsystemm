@@ -282,6 +282,9 @@ const INTERMEDIATE_ATTEMPT: EscalationAttempt = {
   inputTokens: 200,
   outputTokens: 80,
   escalated: true,
+  latencyMs: 150,
+  costUsd: 0.00042,
+  priceKey: "anthropic-direct:claude-haiku-4-5-20251001",
 };
 
 const FINAL_ATTEMPT: EscalationAttempt = {
@@ -292,6 +295,9 @@ const FINAL_ATTEMPT: EscalationAttempt = {
   inputTokens: 800,
   outputTokens: 300,
   escalated: false,
+  latencyMs: 800,
+  costUsd: 0.0345,
+  priceKey: "anthropic-direct:claude-opus-4-8",
 };
 
 test("buildEscalationAttemptRow: intermediate — status is escalated", () => {
@@ -349,6 +355,7 @@ test("buildEscalationAttemptRow: openrouter gateway extracted correctly", () => 
     ...INTERMEDIATE_ATTEMPT,
     providerId: "openrouter:anthropic/claude-haiku-4-5-20251001",
     model: "anthropic/claude-haiku-4-5-20251001",
+    priceKey: "openrouter:anthropic/claude-haiku-4-5-20251001",
   };
   const row = buildEscalationAttemptRow(
     COMPANY_ID, DUMMY_INPUT, orAttempt, null, false,
@@ -416,6 +423,9 @@ test("chain: three-attempt chain — middle row links to first, final links to m
     inputTokens: 400,
     outputTokens: 150,
     escalated: true,
+    latencyMs: 350,
+    costUsd: null,
+    priceKey: null,
   };
 
   const middleRow = buildEscalationAttemptRow(
@@ -456,20 +466,20 @@ test("buildEscalationAttemptRow: final — completed_at set from opts", () => {
   assert.equal(row.completed_at, completedAt);
 });
 
-test("buildEscalationAttemptRow: intermediate — latency_ms is null", () => {
+test("buildEscalationAttemptRow: intermediate — latency_ms from attempt (not null)", () => {
   const row = buildEscalationAttemptRow(
     COMPANY_ID, DUMMY_INPUT, INTERMEDIATE_ATTEMPT, null, false,
-    { startedAt: STARTED_AT, latencyMs: 999 },  // latencyMs ignored for intermediate
+    { startedAt: STARTED_AT },
   );
-  assert.equal(row.latency_ms, null);
+  assert.equal(row.latency_ms, INTERMEDIATE_ATTEMPT.latencyMs);
 });
 
-test("buildEscalationAttemptRow: final — latency_ms from opts", () => {
+test("buildEscalationAttemptRow: final — latency_ms from attempt (not from opts)", () => {
   const row = buildEscalationAttemptRow(
     COMPANY_ID, DUMMY_INPUT, FINAL_ATTEMPT, DUMMY_RESULT, true,
-    { startedAt: STARTED_AT, latencyMs: 3200 },
+    { startedAt: STARTED_AT, latencyMs: 3200 },  // opts.latencyMs ignored — attempt wins
   );
-  assert.equal(row.latency_ms, 3200);
+  assert.equal(row.latency_ms, FINAL_ATTEMPT.latencyMs);
 });
 
 // ── cache_hit invariant ───────────────────────────────────────────────────────
@@ -499,6 +509,9 @@ test("token tracking: each attempt row carries its own token counts", () => {
       inputTokens: 100,
       outputTokens: 40,
       escalated: true,
+      latencyMs: 120,
+      costUsd: null,
+      priceKey: null,
     },
     {
       tier: "medium",
@@ -508,6 +521,9 @@ test("token tracking: each attempt row carries its own token counts", () => {
       inputTokens: 300,
       outputTokens: 90,
       escalated: false,
+      latencyMs: 400,
+      costUsd: null,
+      priceKey: null,
     },
   ];
 

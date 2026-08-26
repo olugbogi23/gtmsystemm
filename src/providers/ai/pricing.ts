@@ -96,6 +96,19 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
+ * Extracts the gateway name from a provider id or pricing key.
+ * Provider ids follow the "gateway:model" format, e.g.:
+ *   "anthropic-direct:claude-opus-4-8"  → "anthropic-direct"
+ *   "openrouter:anthropic/claude-haiku" → "openrouter"
+ * Returns null for ids that don't match the pattern.
+ */
+export function extractGateway(providerId: string): string | null {
+  const colonIdx = providerId.indexOf(":");
+  if (colonIdx <= 0) return null;
+  return providerId.slice(0, colonIdx);
+}
+
+/**
  * Build the pricing registry key from a gateway name and model string.
  * Produces the same format as AIProvider.id ("gateway:model").
  */

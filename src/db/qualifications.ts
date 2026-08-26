@@ -13,10 +13,14 @@
 import type { CompanyRecord, QualificationInput, QualificationResult } from "../domain/types";
 import type { EscalationAttempt, EscalationResult } from "../providers/ai/escalation-router";
 import type { TaskType } from "../providers/ai/model-router";
-import { estimateCost, makePriceKey } from "../providers/ai/pricing";
+import { estimateCost, makePriceKey, extractGateway } from "../providers/ai/pricing";
 import { getSupabaseAdmin } from "./supabase";
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+// extractGateway is re-exported from pricing.ts for consumers that still import it
+// from this module (tests, etc.).  The canonical definition lives in pricing.ts.
+export { extractGateway } from "../providers/ai/pricing";
 
 /** Compact, provider-agnostic snapshot of what the AI saw (for provenance). */
 function inputSnapshot(input: QualificationInput) {
@@ -34,19 +38,6 @@ function inputSnapshot(input: QualificationInput) {
     icp: input.icp,
     signals: input.signals ?? [],
   };
-}
-
-/**
- * Extracts the gateway name from a provider id.
- * Provider ids follow the "gateway:model" format, e.g.:
- *   "anthropic-direct:claude-opus-4-8"  → "anthropic-direct"
- *   "openrouter:anthropic/claude-haiku" → "openrouter"
- * Returns null for ids that don't match the pattern.
- */
-export function extractGateway(providerId: string): string | null {
-  const colonIdx = providerId.indexOf(":");
-  if (colonIdx <= 0) return null;
-  return providerId.slice(0, colonIdx);
 }
 
 // ── Options ───────────────────────────────────────────────────────────────────
@@ -171,18 +162,11 @@ export function buildEscalationAttemptRow(
     escalatedFromRunId?: string;
     startedAt: string;
     completedAt?: string;
+    /** @deprecated Per-attempt latency is now sourced from attempt.latencyMs. */
     latencyMs?: number;
   },
 ): Record<string, unknown> {
   const gateway = extractGateway(attempt.providerId);
-
-  // attempt.providerId is already "gateway:model" — use it directly as the price key.
-  const costUsd = resolveCost(
-    undefined,
-    attempt.providerId,
-    attempt.inputTokens,
-    attempt.outputTokens,
-  );
 
   return {
     company_id: companyId,
@@ -199,8 +183,9 @@ export function buildEscalationAttemptRow(
     // Stage 5 fields:
     gateway,
     task_type: opts.taskType ?? null,
-    latency_ms: isFinalAttempt ? (opts.latencyMs ?? null) : null,
-    cost_usd: costUsd,
+    // Stage 6: per-attempt timing and cost — pre-computed by the executor.
+    latency_ms: attempt.latencyMs,
+    cost_usd: attempt.costUsd ?? null,
     error_message: null,
     cache_hit: null,
     escalated_from_run_id: opts.escalatedFromRunId ?? null,
