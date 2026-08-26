@@ -1,14 +1,19 @@
 /**
  * Persist AI qualification runs into `enrichment_runs`.
  *
- * Stage 5 additions: gateway, task_type, latency_ms, cost_usd, error_message,
- * cache_hit, escalated_from_run_id.  The `buildQualificationRow` and
- * `buildEscalationAttemptRow` helpers are exported so tests can verify the
- * field-mapping logic without hitting the database.
+ * Stage 5: gateway, task_type, latency_ms, cost_usd, error_message,
+ * cache_hit, escalated_from_run_id.
+ * Stage 6 (pricing): cost_usd is now auto-computed from the pricing registry
+ * when opts.costUsd is not explicitly set and tokens + gateway are available.
+ *
+ * The `buildQualificationRow` and `buildEscalationAttemptRow` helpers are
+ * exported so tests can verify field-mapping and cost-computation logic without
+ * hitting the database.
  */
 import type { CompanyRecord, QualificationInput, QualificationResult } from "../domain/types";
 import type { EscalationAttempt, EscalationResult } from "../providers/ai/escalation-router";
 import type { TaskType } from "../providers/ai/model-router";
+import { estimateCost, makePriceKey } from "../providers/ai/pricing";
 import { getSupabaseAdmin } from "./supabase";
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -75,11 +80,36 @@ export interface StoreEscalationOptions {
   totalLatencyMs?: number;
 }
 
+// ── Cost resolution ───────────────────────────────────────────────────────────
+
+/**
+ * Resolves cost_usd for a DB row:
+ *   1. explicit takes priority (even when it's 0)
+ *   2. auto-compute from pricing registry when priceKey + both token counts available
+ *   3. null otherwise
+ */
+function resolveCost(
+  explicit: number | undefined,
+  priceKey: string | null,
+  inputTokens: number | null | undefined,
+  outputTokens: number | null | undefined,
+): number | null {
+  if (explicit !== undefined) return explicit;
+  if (!priceKey || inputTokens == null || outputTokens == null) return null;
+  const estimate = estimateCost(priceKey, inputTokens, outputTokens);
+  return estimate?.totalCostUsd ?? null;
+}
+
 // ── Pure row-builders (exported for testing) ──────────────────────────────────
 
 /**
  * Builds the DB row dict for a single qualification result.
  * Pure — no I/O; safe to test without a DB.
+ *
+ * cost_usd is resolved in this order:
+ *   1. opts.costUsd if explicitly provided (even 0)
+ *   2. Auto-computed from pricing registry using opts.gateway + result.model + tokens
+ *   3. null when gateway or tokens are unavailable / model not in registry
  */
 export function buildQualificationRow(
   companyId: string,
@@ -88,6 +118,13 @@ export function buildQualificationRow(
   startedAt: string,
   opts: StoreQualificationOptions = {},
 ): Record<string, unknown> {
+  const costUsd = resolveCost(
+    opts.costUsd,
+    opts.gateway ? makePriceKey(opts.gateway, result.model) : null,
+    result.inputTokens ?? null,
+    result.outputTokens ?? null,
+  );
+
   return {
     company_id: companyId,
     provider: result.model,
@@ -104,9 +141,9 @@ export function buildQualificationRow(
     gateway: opts.gateway ?? null,
     task_type: opts.taskType ?? null,
     latency_ms: opts.latencyMs ?? null,
-    cost_usd: opts.costUsd ?? null,
+    cost_usd: costUsd,
     error_message: opts.errorMessage ?? null,
-    cache_hit: null,               // reserved — caching not yet implemented
+    cache_hit: null,
     escalated_from_run_id: opts.escalatedFromRunId ?? null,
   };
 }
@@ -138,13 +175,21 @@ export function buildEscalationAttemptRow(
   },
 ): Record<string, unknown> {
   const gateway = extractGateway(attempt.providerId);
+
+  // attempt.providerId is already "gateway:model" — use it directly as the price key.
+  const costUsd = resolveCost(
+    undefined,
+    attempt.providerId,
+    attempt.inputTokens,
+    attempt.outputTokens,
+  );
+
   return {
     company_id: companyId,
     provider: attempt.model,
     operation: "ai_qualification",
     status: isFinalAttempt ? "completed" : "escalated",
     input_data: inputSnapshot(input),
-    // Only the final attempt stores the full result in output_data.
     output_data: isFinalAttempt ? (finalResult ?? null) : null,
     started_at: opts.startedAt,
     completed_at: isFinalAttempt ? (opts.completedAt ?? null) : null,
@@ -155,7 +200,7 @@ export function buildEscalationAttemptRow(
     gateway,
     task_type: opts.taskType ?? null,
     latency_ms: isFinalAttempt ? (opts.latencyMs ?? null) : null,
-    cost_usd: null,         // per-attempt cost requires model price table; deferred
+    cost_usd: costUsd,
     error_message: null,
     cache_hit: null,
     escalated_from_run_id: opts.escalatedFromRunId ?? null,
