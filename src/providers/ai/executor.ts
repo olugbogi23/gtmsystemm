@@ -1,29 +1,59 @@
 /**
- * AI execution wrapper — Stage 6.
+ * Task-agnostic AI execution wrapper — Stage 7.
  *
- * Wraps a single AIProvider.qualifyCompany() call and automatically captures:
+ * The core function execute<T>() wraps ANY AI provider call and automatically
+ * captures the observability fields that every task type needs identically:
  *   - Wall-clock latency
  *   - Gateway identifier (extracted from provider.id)
- *   - Token counts (from QualificationResult)
+ *   - Token counts (from the result's inputTokens / outputTokens fields)
  *   - USD cost (looked up in the centralized pricing registry)
  *
- * This is the single place responsible for wiring a provider call to the
- * pricing engine.  Callers (EscalationRouter, workflow tasks) receive an
- * ExecutionResult that already contains everything needed for DB persistence
- * — no manual cost math, no gateway string parsing.
+ * This ensures that ICP qualification, personalization, campaign strategy,
+ * prefilter, reply classification, text normalization, and any future GTM
+ * task all share the same execution infrastructure without duplication.
  *
- * When the provider's model is not in the pricing registry, costUsd is null
- * and a warning is emitted so the gap is observable in logs.
+ * Contract for result types: any type T used with execute<T>() must extend
+ * AITaskResult — the minimum shape the executor needs for observability.
+ * QualificationResult already satisfies this contract.  Future task result
+ * types (PersonalizationResult, CampaignStrategyResult, …) must too.
+ *
+ * executeQualification() is a thin convenience wrapper for the current
+ * sole consumer.  New task wrappers follow the same pattern:
+ *
+ *   export function executePersonalization(provider, input) {
+ *     return execute(provider, () => provider.personalizeEmail(input));
+ *   }
  */
 import type { AIProvider } from "../types";
 import type { QualificationInput, QualificationResult } from "../../domain/types";
 import { extractGateway, makePriceKey, estimateCost } from "./pricing";
 
+// ── Contract ──────────────────────────────────────────────────────────────────
+
+/**
+ * Minimum shape required of any AI task result.
+ * The executor reads only these three fields; everything else is task-specific
+ * and is passed through to the caller untouched.
+ */
+export interface AITaskResult {
+  /** Model string as reported by the provider (used for pricing lookup). */
+  model: string;
+  /** Prompt token count. May be absent if the provider doesn't report usage. */
+  inputTokens?: number;
+  /** Completion token count. May be absent if the provider doesn't report usage. */
+  outputTokens?: number;
+}
+
 // ── Result type ───────────────────────────────────────────────────────────────
 
-export interface ExecutionResult {
-  /** Full qualification result from the provider. */
-  result: QualificationResult;
+/**
+ * Generic result returned by execute<T>().
+ * T is the task-specific result type (e.g. QualificationResult).
+ * The default preserves backward compat for callers that don't specify T.
+ */
+export interface ExecutionResult<T extends AITaskResult = QualificationResult> {
+  /** The full task-specific result from the provider. */
+  result: T;
   /** Gateway extracted from provider.id, e.g. "anthropic-direct" or "openrouter". */
   gateway: string | null;
   /** Pricing registry key used for cost lookup ("gateway:model"), or null. */
@@ -38,22 +68,29 @@ export interface ExecutionResult {
   costUsd: number | null;
 }
 
-// ── Executor ──────────────────────────────────────────────────────────────────
+// ── Core executor ─────────────────────────────────────────────────────────────
 
 /**
- * Execute a single AI qualification call with automatic observability capture.
+ * Execute any AI task call with automatic observability capture.
  *
- * No real API calls are made here — the provider is responsible for that.
- * This function only wraps the call and enriches the result.
+ * Usage:
+ *   const exec = await execute(provider, () => provider.qualifyCompany(input));
+ *   const exec = await execute(provider, () => provider.personalizeEmail(input));
+ *
+ * @param provider  Any object with an `id` string (used for gateway extraction).
+ *                  AIProvider, future PersonalizationProvider, etc. all qualify.
+ * @param call      Zero-argument async factory that performs the actual AI call.
+ *                  Returning a plain () => promise makes the call injectable for
+ *                  testing — mock providers work without any special setup.
  */
-export async function executeQualification(
-  provider: AIProvider,
-  input: QualificationInput,
-): Promise<ExecutionResult> {
+export async function execute<T extends AITaskResult>(
+  provider: { id: string },
+  call: () => Promise<T>,
+): Promise<ExecutionResult<T>> {
   const gateway = extractGateway(provider.id);
 
   const startMs = Date.now();
-  const result = await provider.qualifyCompany(input);
+  const result = await call();
   const latencyMs = Date.now() - startMs;
 
   const inputTokens = result.inputTokens ?? 0;
@@ -75,4 +112,18 @@ export async function executeQualification(
     outputTokens,
     costUsd: estimate?.totalCostUsd ?? null,
   };
+}
+
+// ── Task-specific wrappers ────────────────────────────────────────────────────
+
+/**
+ * Convenience wrapper for ICP qualification.
+ * Delegates entirely to execute<QualificationResult>().
+ * New task types follow the same pattern — no observability logic is repeated.
+ */
+export function executeQualification(
+  provider: AIProvider,
+  input: QualificationInput,
+): Promise<ExecutionResult<QualificationResult>> {
+  return execute(provider, () => provider.qualifyCompany(input));
 }

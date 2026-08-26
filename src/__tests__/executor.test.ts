@@ -1,5 +1,5 @@
 /**
- * Stage 6 — executor tests.
+ * Stage 6 / 7 — executor tests.
  *
  * Verifies that executeQualification() automatically captures gateway,
  * latency, tokens, and cost from a provider call — without any real API calls.
@@ -7,8 +7,11 @@
  * Also verifies the EscalationRouter integration: that EscalationAttempt
  * objects produced by qualify() carry the executor-computed fields.
  *
+ * Stage 7 additions: tests for the generic execute<T>() function that prove
+ * the execution infrastructure works for non-qualification result types.
+ *
  * Coverage:
- *   executeQualification  — all ExecutionResult fields
+ *   executeQualification  — all ExecutionResult fields (Stage 6)
  *   Gateway extraction    — anthropic-direct, openrouter, unknown format
  *   Pricing integration   — known model → correct costUsd; unknown → null
  *   Token defaults        — result with no tokens → inputTokens/outputTokens = 0
@@ -16,11 +19,17 @@
  *   EscalationRouter     — attempts carry latencyMs, costUsd, priceKey
  *   EscalationResult     — totalCostUsd sums across attempts; null when any unknown
  *   Mixed pricing         — null propagates correctly in totalCostUsd
+ *   Generic execute<T>   — same infrastructure works for any AITaskResult (Stage 7)
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { executeQualification, type ExecutionResult } from "../providers/ai/executor";
+import {
+  execute,
+  executeQualification,
+  type AITaskResult,
+  type ExecutionResult,
+} from "../providers/ai/executor";
 import {
   EscalationRouter,
   type EscalationConfig,
@@ -369,4 +378,102 @@ test("escalation: result includes escalated flag set correctly with executor", a
   assert.equal(result.escalated, true);
   assert.equal(result.attempts[0].escalated, true);
   assert.equal(result.attempts[1].escalated, false);
+});
+
+// ── Generic execute<T> — task-agnostic infrastructure (Stage 7) ───────────────
+//
+// These tests prove that the execution infrastructure works for any AI task
+// result type, not just qualification.  No new workflow is added — these use a
+// minimal stub type to demonstrate the contract is enforced and honoured.
+
+/** Minimal stub result representing a future personalization task. */
+interface PersonalizationStub extends AITaskResult {
+  model: string;
+  subject: string;
+  body: string;
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
+test("execute<T>: works with a non-qualification result type", async () => {
+  const stub: PersonalizationStub = {
+    model: "claude-haiku-4-5-20251001",
+    subject: "Hi {{firstName}}",
+    body: "Congrats on the funding round.",
+    inputTokens: 200,
+    outputTokens: 80,
+  };
+
+  const exec = await execute(
+    { id: "anthropic-direct:claude-haiku-4-5-20251001" },
+    async () => stub,
+  );
+
+  assert.equal(exec.result.subject, "Hi {{firstName}}");
+  assert.equal(exec.result.body, "Congrats on the funding round.");
+  assert.equal(exec.gateway, "anthropic-direct");
+  assert.equal(exec.inputTokens, 200);
+  assert.equal(exec.outputTokens, 80);
+});
+
+test("execute<T>: computes costUsd for non-qualification task using same pricing registry", async () => {
+  // Demonstrates that pricing infrastructure is reused unchanged for any task type.
+  // Haiku: 200 in / 80 out → (200/1M * 0.80) + (80/1M * 4.00)
+  const expected = (200 / 1_000_000) * 0.80 + (80 / 1_000_000) * 4.00;
+  const stub: PersonalizationStub = {
+    model: "claude-haiku-4-5-20251001",
+    subject: "Subject",
+    body: "Body",
+    inputTokens: 200,
+    outputTokens: 80,
+  };
+
+  const exec = await execute(
+    { id: "anthropic-direct:claude-haiku-4-5-20251001" },
+    async () => stub,
+  );
+
+  assert.ok(exec.costUsd !== null);
+  assert.ok(
+    Math.abs(exec.costUsd! - expected) < 1e-12,
+    `Expected ${expected}, got ${exec.costUsd}`,
+  );
+});
+
+test("execute<T>: latency and gateway captured identically across task types", async () => {
+  // Same observability fields regardless of what the task result contains.
+  // For openrouter, the model name includes the "anthropic/" prefix.
+  const stub: PersonalizationStub = {
+    model: "anthropic/claude-sonnet-4-6",
+    subject: "Subject",
+    body: "Body",
+    inputTokens: 0,
+    outputTokens: 0,
+  };
+
+  const exec = await execute(
+    { id: "openrouter:anthropic/claude-sonnet-4-6" },
+    async () => stub,
+  );
+
+  assert.equal(exec.gateway, "openrouter");
+  assert.ok(exec.latencyMs >= 0);
+  assert.equal(exec.priceKey, "openrouter:anthropic/claude-sonnet-4-6");
+});
+
+test("execute<T>: result type is preserved with full TypeScript inference", async () => {
+  // TypeScript structural check: exec.result must be the full PersonalizationStub,
+  // not narrowed down to AITaskResult.
+  const stub: PersonalizationStub = {
+    model: "claude-haiku-4-5-20251001",
+    subject: "My Subject",
+    body: "My Body",
+  };
+
+  const exec = await execute({ id: "anthropic-direct:claude-haiku-4-5-20251001" }, async () => stub);
+
+  // Access task-specific fields — would be a compile error if T was erased to AITaskResult.
+  const result: PersonalizationStub = exec.result;
+  assert.equal(result.subject, "My Subject");
+  assert.equal(result.body, "My Body");
 });
