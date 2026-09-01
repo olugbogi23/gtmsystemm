@@ -9,10 +9,13 @@
 import type {
   CompanyRecord,
   PersonRecord,
+  PersonalizationInput,
+  PersonalizationResult,
   QualificationInput,
   QualificationResult,
   SearchQuery,
 } from "../domain/types";
+import type { SignalIntelligenceInput, SignalIntelligenceResult } from "../domain/signal-types";
 
 export type Capability = "lead-source" | "enrichment" | "ai";
 
@@ -41,4 +44,8 @@ export interface EnrichmentProvider extends BaseProvider {
 export interface AIProvider extends BaseProvider {
   readonly capability: "ai";
   qualifyCompany(input: QualificationInput): Promise<QualificationResult>;
+  /** Optional — providers that support personalization implement this. */
+  personalizeMessage?(input: PersonalizationInput): Promise<PersonalizationResult>;
+  /** Optional — providers that support signal intelligence implement this. */
+  analyzeSignals?(input: SignalIntelligenceInput): Promise<SignalIntelligenceResult>;
 }

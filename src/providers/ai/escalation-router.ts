@@ -72,6 +72,12 @@ export const ESCALATION_DEFAULTS: Record<TaskType, EscalationConfig> = {
     confidenceThreshold: 0.90,
     maxTier: "low",   // single tier — never escalate text normalisation
   },
+  signal_intelligence: {
+    taskType: "signal_intelligence",
+    startTier: "medium",
+    confidenceThreshold: 0.70,
+    maxTier: "medium", // single tier — synthesis tasks don't benefit from escalation
+  },
 };
 
 // ── Result types ──────────────────────────────────────────────────────────────

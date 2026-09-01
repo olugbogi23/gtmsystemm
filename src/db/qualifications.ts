@@ -5,6 +5,8 @@
  * cache_hit, escalated_from_run_id.
  * Stage 6 (pricing): cost_usd is now auto-computed from the pricing registry
  * when opts.costUsd is not explicitly set and tokens + gateway are available.
+ * Stage 10: job_id + attempt_number columns; storeEscalationResult is now
+ * idempotent — retries return existing row IDs instead of creating duplicates.
  *
  * The `buildQualificationRow` and `buildEscalationAttemptRow` helpers are
  * exported so tests can verify field-mapping and cost-computation logic without
@@ -60,6 +62,10 @@ export interface StoreQualificationOptions {
   errorMessage?: string;
   /** FK to the cheaper attempt this run escalated from. */
   escalatedFromRunId?: string;
+  /** Stage 10: FK to the jobs row that produced this run. */
+  jobId?: string;
+  /** Stage 10: 0-based attempt number within the escalation chain. */
+  attemptNumber?: number;
 }
 
 export interface StoreEscalationOptions {
@@ -69,6 +75,8 @@ export interface StoreEscalationOptions {
   updateIcpScore?: boolean;
   /** Total wall-clock ms for the entire escalation (across all attempts). */
   totalLatencyMs?: number;
+  /** Stage 10: FK to the jobs row — enables duplicate-run prevention. */
+  jobId?: string;
 }
 
 // ── Cost resolution ───────────────────────────────────────────────────────────
@@ -136,6 +144,8 @@ export function buildQualificationRow(
     error_message: opts.errorMessage ?? null,
     cache_hit: null,
     escalated_from_run_id: opts.escalatedFromRunId ?? null,
+    job_id: opts.jobId ?? null,
+    attempt_number: opts.attemptNumber ?? null,
   };
 }
 
@@ -164,6 +174,10 @@ export function buildEscalationAttemptRow(
     completedAt?: string;
     /** @deprecated Per-attempt latency is now sourced from attempt.latencyMs. */
     latencyMs?: number;
+    /** Stage 10: FK to the jobs row — enables duplicate-run prevention. */
+    jobId?: string;
+    /** Stage 10: 0-based index of this attempt within the escalation chain. */
+    attemptNumber?: number;
   },
 ): Record<string, unknown> {
   const gateway = extractGateway(attempt.providerId);
@@ -189,6 +203,9 @@ export function buildEscalationAttemptRow(
     error_message: null,
     cache_hit: null,
     escalated_from_run_id: opts.escalatedFromRunId ?? null,
+    // Stage 10: operation identity
+    job_id: opts.jobId ?? null,
+    attempt_number: opts.attemptNumber ?? null,
   };
 }
 
@@ -231,6 +248,10 @@ export async function storeQualification(
  * one row per attempt.  Rows are linked via escalated_from_run_id so the
  * full escalation path is queryable.
  *
+ * Stage 10: when opts.jobId is provided, each row gets job_id + attempt_number.
+ * The unique index on (job_id, attempt_number) makes this call idempotent:
+ * a retry that finds an existing row returns its ID without creating a duplicate.
+ *
  * Chain layout (example: low → medium → high):
  *   [0] low  attempt  — status: "escalated", escalated_from_run_id: null
  *   [1] mid  attempt  — status: "escalated", escalated_from_run_id: row[0].id
@@ -267,19 +288,13 @@ export async function storeEscalationResult(
         startedAt,
         completedAt: isFinal ? escalation.result.qualifiedAt : undefined,
         latencyMs: isFinal ? opts.totalLatencyMs : undefined,
+        jobId: opts.jobId,
+        attemptNumber: i,
       },
     );
 
-    const { data, error } = await db
-      .from("enrichment_runs")
-      .insert(row)
-      .select("id")
-      .single();
-    if (error) {
-      throw new Error(`storeEscalationResult failed at attempt ${i}: ${error.message}`);
-    }
-
-    runIds.push((data as { id: string }).id);
+    const runId = await insertOrFindEnrichmentRun(db, row, opts.jobId, i);
+    runIds.push(runId);
   }
 
   if (opts.updateIcpScore) {
@@ -291,4 +306,41 @@ export async function storeEscalationResult(
   }
 
   return { runIds, finalRunId: runIds[runIds.length - 1] };
+}
+
+/**
+ * Inserts an enrichment_run row. If the (job_id, attempt_number) unique constraint
+ * fires (error 23505), looks up and returns the existing row's ID instead.
+ *
+ * This makes storeEscalationResult idempotent: a Trigger.dev retry that re-runs
+ * the enrichment write returns the same IDs without creating duplicate rows.
+ */
+async function insertOrFindEnrichmentRun(
+  db: ReturnType<typeof getSupabaseAdmin>,
+  row: Record<string, unknown>,
+  jobId: string | undefined,
+  attemptNumber: number,
+): Promise<string> {
+  const { data, error } = await db
+    .from("enrichment_runs")
+    .insert(row)
+    .select("id")
+    .single();
+
+  if (!error) return (data as { id: string }).id;
+
+  if (error.code === "23505" && jobId != null) {
+    const { data: existing, error: lookupErr } = await db
+      .from("enrichment_runs")
+      .select("id")
+      .eq("job_id", jobId)
+      .eq("attempt_number", attemptNumber)
+      .single();
+    if (lookupErr) {
+      throw new Error(`insertOrFindEnrichmentRun lookup failed: ${lookupErr.message}`);
+    }
+    return (existing as { id: string }).id;
+  }
+
+  throw new Error(`storeEscalationResult failed at attempt ${attemptNumber}: ${error.message}`);
 }

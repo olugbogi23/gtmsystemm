@@ -1,15 +1,14 @@
 /**
- * Typed helpers for the existing `jobs` table (the orchestration/job-queue
- * record). These are the create/read/update/complete primitives the
- * Trigger.dev tasks use to record their own progress in Supabase.
+ * Typed helpers for the `jobs` table.
  *
- * Aligned to the LIVE schema (inspected via PostgREST) — no columns invented.
+ * Stage 10 additions:
+ *   - `idempotency_key` native column (was buried in input_data JSONB)
+ *   - `claimJob()` — atomic find-or-create using the DB unique constraint
  */
 import { getSupabaseAdmin } from "./supabase";
 
 const TABLE = "jobs";
 
-/** Mirror of the live `jobs` row. */
 export interface JobRow {
   id: string;
   job_type: string;
@@ -28,10 +27,12 @@ export interface JobRow {
   completed_at: string | null;
   created_at: string;
   updated_at: string;
+  idempotency_key: string | null;
 }
 
 export interface CreateJobInput {
   jobType: string;
+  idempotencyKey?: string;
   provider?: string;
   totalItems?: number;
   inputData?: unknown;
@@ -61,11 +62,80 @@ export async function createJob(input: CreateJobInput): Promise<JobRow> {
       successful_items: 0,
       failed_items: 0,
       input_data: input.inputData ?? null,
+      idempotency_key: input.idempotencyKey ?? null,
     })
     .select()
     .single();
   if (error) throw new Error(`createJob failed: ${error.message}`);
   return data as JobRow;
+}
+
+export interface ClaimJobInput extends CreateJobInput {
+  idempotencyKey: string;
+}
+
+/**
+ * Atomically finds or creates a job for the given (jobType, idempotencyKey).
+ *
+ * If an active (non-failed, non-cancelled) job already exists for this pair →
+ * returns { job, created: false }.
+ *
+ * If no active job exists → inserts a new pending row → returns { job, created: true }.
+ *
+ * Concurrent safety: the partial unique index `jobs_active_idempotency_idx` ensures
+ * only one INSERT wins. The losing concurrent request gets error 23505, falls through
+ * to the lookup path, and returns the winner's row.
+ */
+export async function claimJob(
+  input: ClaimJobInput,
+): Promise<{ job: JobRow; created: boolean }> {
+  const db = getSupabaseAdmin();
+
+  const { data, error } = await db
+    .from(TABLE)
+    .insert({
+      job_type: input.jobType,
+      idempotency_key: input.idempotencyKey,
+      status: "pending",
+      provider: input.provider ?? null,
+      total_items: input.totalItems ?? 0,
+      processed_items: 0,
+      successful_items: 0,
+      failed_items: 0,
+      input_data: input.inputData ?? null,
+    })
+    .select()
+    .single();
+
+  if (!error) return { job: data as JobRow, created: true };
+
+  // Unique violation: an active job already exists for this (job_type, idempotency_key).
+  if (error.code === "23505") {
+    const { data: existing, error: lookupErr } = await db
+      .from(TABLE)
+      .select("*")
+      .eq("job_type", input.jobType)
+      .eq("idempotency_key", input.idempotencyKey)
+      .not("status", "in", `("failed","cancelled")`)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (lookupErr) {
+      throw new Error(`claimJob lookup failed: ${lookupErr.message}`);
+    }
+    if (!existing) {
+      // Extremely narrow race: the job was completed and the partial index now
+      // excludes it... but 'completed' is still in the index. Should not happen.
+      throw new Error(
+        `claimJob: unique violation but no active job found for ` +
+          `(${input.jobType}, ${input.idempotencyKey}) — possible race condition`,
+      );
+    }
+    return { job: existing as JobRow, created: false };
+  }
+
+  throw new Error(`claimJob failed: ${error.message}`);
 }
 
 export async function getJob(id: string): Promise<JobRow | null> {
@@ -100,7 +170,6 @@ export async function updateJob(id: string, patch: UpdateJobPatch): Promise<JobR
   return data as JobRow;
 }
 
-/** Convenience: mark a job finished with final counts + output. */
 export async function completeJob(
   id: string,
   opts: { successfulItems?: number; failedItems?: number; outputData?: unknown } = {},
@@ -112,7 +181,6 @@ export async function completeJob(
   });
 }
 
-/** Used to clean up connectivity-test rows so business data stays clean. */
 export async function deleteJob(id: string): Promise<void> {
   const { error } = await getSupabaseAdmin().from(TABLE).delete().eq("id", id);
   if (error) throw new Error(`deleteJob failed: ${error.message}`);

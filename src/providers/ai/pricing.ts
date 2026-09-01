@@ -76,12 +76,18 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   },
 
   // ── OpenRouter (Anthropic models via gateway, list price pass-through) ─────
-  "openrouter:anthropic/claude-haiku-4-5-20251001": {
+  "openrouter:anthropic/claude-haiku-4.5": {
     label: "Claude Haiku 4.5 (OpenRouter)",
     inputPer1M: 0.80,
     outputPer1M: 4.00,
   },
   "openrouter:anthropic/claude-sonnet-4-6": {
+    label: "Claude Sonnet 4.6 (OpenRouter)",
+    inputPer1M: 3.00,
+    outputPer1M: 15.00,
+  },
+  // OpenRouter returns dot notation in response.model — alias for the same model
+  "openrouter:anthropic/claude-sonnet-4.6": {
     label: "Claude Sonnet 4.6 (OpenRouter)",
     inputPer1M: 3.00,
     outputPer1M: 15.00,

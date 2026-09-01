@@ -1,12 +1,23 @@
 import OpenAI from "openai";
 import { ENV_KEYS, optionalEnv, requireEnv } from "../../config/env";
-import type { QualificationInput, QualificationResult } from "../../domain/types";
+import type { PersonalizationInput, PersonalizationResult, QualificationInput, QualificationResult } from "../../domain/types";
+import type { SignalIntelligenceInput, SignalIntelligenceResult } from "../../domain/signal-types";
 import type { AIProvider } from "../types";
 import {
   buildQualificationPrompt,
   QUALIFICATION_SCHEMA,
   QUALIFICATION_SYSTEM,
 } from "./qualification-prompt";
+import {
+  buildPersonalizationPrompt,
+  PERSONALIZATION_SCHEMA,
+  PERSONALIZATION_SYSTEM,
+} from "./personalization-prompt";
+import {
+  buildSignalIntelligencePrompt,
+  SIGNAL_INTELLIGENCE_SCHEMA,
+  SIGNAL_INTELLIGENCE_SYSTEM,
+} from "./signal-intelligence-prompt";
 
 export interface OpenRouterProviderOptions {
   model: string;
@@ -101,6 +112,72 @@ export class OpenRouterProvider implements AIProvider {
       ...parsed,
       model: response.model ?? this.model,
       qualifiedAt: new Date().toISOString(),
+      inputTokens: response.usage?.prompt_tokens,
+      outputTokens: response.usage?.completion_tokens,
+    };
+  }
+
+  async personalizeMessage(input: PersonalizationInput): Promise<PersonalizationResult> {
+    const response = await getClient().chat.completions.create({
+      model: this.model,
+      messages: [
+        { role: "system" as const, content: PERSONALIZATION_SYSTEM },
+        { role: "user" as const, content: buildPersonalizationPrompt(input) },
+      ],
+      response_format: {
+        type: "json_schema" as const,
+        json_schema: {
+          name: "personalization",
+          strict: true,
+          schema: PERSONALIZATION_SCHEMA as Record<string, unknown>,
+        },
+      },
+      max_tokens: 1000,
+    });
+
+    const text = response.choices[0]?.message?.content ?? "";
+    const parsed = JSON.parse(text) as Omit<
+      PersonalizationResult,
+      "model" | "personalizedAt" | "inputTokens" | "outputTokens"
+    >;
+
+    return {
+      ...parsed,
+      model: response.model ?? this.model,
+      personalizedAt: new Date().toISOString(),
+      inputTokens: response.usage?.prompt_tokens,
+      outputTokens: response.usage?.completion_tokens,
+    };
+  }
+
+  async analyzeSignals(input: SignalIntelligenceInput): Promise<SignalIntelligenceResult> {
+    const response = await getClient().chat.completions.create({
+      model: this.model,
+      messages: [
+        { role: "system" as const, content: SIGNAL_INTELLIGENCE_SYSTEM },
+        { role: "user" as const, content: buildSignalIntelligencePrompt(input) },
+      ],
+      response_format: {
+        type: "json_schema" as const,
+        json_schema: {
+          name: "signal_intelligence",
+          strict: true,
+          schema: SIGNAL_INTELLIGENCE_SCHEMA as Record<string, unknown>,
+        },
+      },
+      max_tokens: 1500,
+    });
+
+    const text = response.choices[0]?.message?.content ?? "";
+    const parsed = JSON.parse(text) as Omit<
+      SignalIntelligenceResult,
+      "model" | "analyzedAt" | "inputTokens" | "outputTokens"
+    >;
+
+    return {
+      ...parsed,
+      model: response.model ?? this.model,
+      analyzedAt: new Date().toISOString(),
       inputTokens: response.usage?.prompt_tokens,
       outputTokens: response.usage?.completion_tokens,
     };

@@ -25,7 +25,8 @@
  *   }
  */
 import type { AIProvider } from "../types";
-import type { QualificationInput, QualificationResult } from "../../domain/types";
+import type { PersonalizationInput, PersonalizationResult, QualificationInput, QualificationResult } from "../../domain/types";
+import type { SignalIntelligenceInput, SignalIntelligenceResult } from "../../domain/signal-types";
 import { extractGateway, makePriceKey, estimateCost } from "./pricing";
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -126,4 +127,47 @@ export function executeQualification(
   input: QualificationInput,
 ): Promise<ExecutionResult<QualificationResult>> {
   return execute(provider, () => provider.qualifyCompany(input));
+}
+
+/**
+ * Minimum interface required to run a personalization task.
+ * Any provider that implements personalizeMessage() satisfies this.
+ */
+export interface PersonalizationCapable {
+  id: string;
+  personalizeMessage(input: PersonalizationInput): Promise<PersonalizationResult>;
+}
+
+/**
+ * Convenience wrapper for personalization.
+ * Delegates entirely to execute<PersonalizationResult>() — zero observability
+ * logic is repeated; latency, tokens, and cost are captured identically to
+ * executeQualification().
+ */
+export function executePersonalization(
+  provider: PersonalizationCapable,
+  input: PersonalizationInput,
+): Promise<ExecutionResult<PersonalizationResult>> {
+  return execute(provider, () => provider.personalizeMessage(input));
+}
+
+/**
+ * Minimum interface required to run a signal intelligence task.
+ * Any provider that implements analyzeSignals() satisfies this.
+ */
+export interface SignalIntelligenceCapable {
+  id: string;
+  analyzeSignals(input: SignalIntelligenceInput): Promise<SignalIntelligenceResult>;
+}
+
+/**
+ * Convenience wrapper for signal intelligence (WHY NOW analysis).
+ * Same observability infrastructure as qualification and personalization —
+ * latency, tokens, cost, and gateway are captured identically.
+ */
+export function executeSignalIntelligence(
+  provider: SignalIntelligenceCapable,
+  input: SignalIntelligenceInput,
+): Promise<ExecutionResult<SignalIntelligenceResult>> {
+  return execute(provider, () => provider.analyzeSignals(input));
 }

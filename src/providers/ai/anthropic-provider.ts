@@ -1,12 +1,23 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { ENV_KEYS, optionalEnv, requireEnv } from "../../config/env";
-import type { QualificationInput, QualificationResult } from "../../domain/types";
+import type { PersonalizationInput, PersonalizationResult, QualificationInput, QualificationResult } from "../../domain/types";
+import type { SignalIntelligenceInput, SignalIntelligenceResult } from "../../domain/signal-types";
 import type { AIProvider } from "../types";
 import {
   buildQualificationPrompt,
   QUALIFICATION_SCHEMA,
   QUALIFICATION_SYSTEM,
 } from "./qualification-prompt";
+import {
+  buildPersonalizationPrompt,
+  PERSONALIZATION_SCHEMA,
+  PERSONALIZATION_SYSTEM,
+} from "./personalization-prompt";
+import {
+  buildSignalIntelligencePrompt,
+  SIGNAL_INTELLIGENCE_SCHEMA,
+  SIGNAL_INTELLIGENCE_SYSTEM,
+} from "./signal-intelligence-prompt";
 
 export interface AnthropicProviderOptions {
   /** Defaults to "claude-opus-4-8". */
@@ -20,7 +31,11 @@ export interface AnthropicProviderOptions {
 let _client: Anthropic | undefined;
 function getClient(): Anthropic {
   if (!_client) {
-    _client = new Anthropic({ apiKey: requireEnv(ENV_KEYS.anthropicApiKey) });
+    const workspaceId = optionalEnv(ENV_KEYS.anthropicWorkspaceId);
+    _client = new Anthropic({
+      apiKey: requireEnv(ENV_KEYS.anthropicApiKey),
+      ...(workspaceId && { defaultHeaders: { "anthropic-workspace-id": workspaceId } }),
+    });
   }
   return _client;
 }
@@ -86,6 +101,70 @@ export class AnthropicDirectProvider implements AIProvider {
       ...parsed,
       model: this.model,
       qualifiedAt: new Date().toISOString(),
+      inputTokens: response.usage.input_tokens,
+      outputTokens: response.usage.output_tokens,
+    };
+  }
+
+  async personalizeMessage(input: PersonalizationInput): Promise<PersonalizationResult> {
+    const params: Anthropic.MessageCreateParamsNonStreaming = {
+      model: this.model,
+      max_tokens: this.maxTokens,
+      system: PERSONALIZATION_SYSTEM,
+      output_config: {
+        format: { type: "json_schema", schema: PERSONALIZATION_SCHEMA },
+      },
+      messages: [{ role: "user", content: buildPersonalizationPrompt(input) }],
+    } as Anthropic.MessageCreateParamsNonStreaming;
+
+    const response = await getClient().messages.create(params);
+
+    const textBlock = response.content.find((b) => b.type === "text");
+    if (!textBlock || textBlock.type !== "text") {
+      throw new Error("AnthropicDirectProvider.personalizeMessage: no text block in response");
+    }
+
+    const parsed = JSON.parse(textBlock.text) as Omit<
+      PersonalizationResult,
+      "model" | "personalizedAt" | "inputTokens" | "outputTokens"
+    >;
+
+    return {
+      ...parsed,
+      model: this.model,
+      personalizedAt: new Date().toISOString(),
+      inputTokens: response.usage.input_tokens,
+      outputTokens: response.usage.output_tokens,
+    };
+  }
+
+  async analyzeSignals(input: SignalIntelligenceInput): Promise<SignalIntelligenceResult> {
+    const params: Anthropic.MessageCreateParamsNonStreaming = {
+      model: this.model,
+      max_tokens: this.maxTokens,
+      system: SIGNAL_INTELLIGENCE_SYSTEM,
+      output_config: {
+        format: { type: "json_schema", schema: SIGNAL_INTELLIGENCE_SCHEMA },
+      },
+      messages: [{ role: "user", content: buildSignalIntelligencePrompt(input) }],
+    } as Anthropic.MessageCreateParamsNonStreaming;
+
+    const response = await getClient().messages.create(params);
+
+    const textBlock = response.content.find((b) => b.type === "text");
+    if (!textBlock || textBlock.type !== "text") {
+      throw new Error("AnthropicDirectProvider.analyzeSignals: no text block in response");
+    }
+
+    const parsed = JSON.parse(textBlock.text) as Omit<
+      SignalIntelligenceResult,
+      "model" | "analyzedAt" | "inputTokens" | "outputTokens"
+    >;
+
+    return {
+      ...parsed,
+      model: this.model,
+      analyzedAt: new Date().toISOString(),
       inputTokens: response.usage.input_tokens,
       outputTokens: response.usage.output_tokens,
     };

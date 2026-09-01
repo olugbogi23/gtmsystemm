@@ -73,8 +73,8 @@ test("registry: MODEL_PRICING is exported and is a plain object", () => {
   assert.ok(MODEL_PRICING && typeof MODEL_PRICING === "object");
 });
 
-test("registry: contains exactly 6 entries (3 models × 2 gateways)", () => {
-  assert.equal(Object.keys(MODEL_PRICING).length, 6);
+test("registry: contains at least 6 entries (3 models × 2 gateways, plus dot-notation aliases)", () => {
+  assert.ok(Object.keys(MODEL_PRICING).length >= 6);
 });
 
 test("registry: all entries have positive inputPer1M", () => {
@@ -116,8 +116,8 @@ test("registry: anthropic-direct:claude-opus-4-8 is present", () => {
   assert.ok(MODEL_PRICING["anthropic-direct:claude-opus-4-8"]);
 });
 
-test("registry: openrouter:anthropic/claude-haiku-4-5-20251001 is present", () => {
-  assert.ok(MODEL_PRICING["openrouter:anthropic/claude-haiku-4-5-20251001"]);
+test("registry: openrouter:anthropic/claude-haiku-4.5 is present", () => {
+  assert.ok(MODEL_PRICING["openrouter:anthropic/claude-haiku-4.5"]);
 });
 
 test("registry: openrouter:anthropic/claude-sonnet-4-6 is present", () => {
@@ -234,7 +234,7 @@ test("estimateCost: opus 5k input + 1k output", () => {
 
 test("estimateCost: openrouter haiku — same price as direct", () => {
   const direct = estimateCost("anthropic-direct:claude-haiku-4-5-20251001", 1_000, 500);
-  const via = estimateCost("openrouter:anthropic/claude-haiku-4-5-20251001", 1_000, 500);
+  const via = estimateCost("openrouter:anthropic/claude-haiku-4.5", 1_000, 500);
   assert.ok(direct !== null && via !== null);
   assert.equal(via!.totalCostUsd, direct!.totalCostUsd);
 });

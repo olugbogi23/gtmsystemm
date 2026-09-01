@@ -47,6 +47,53 @@ export interface CompanyRecord {
   fetchedAt: string;
 }
 
+/** Input for the AI personalization task. */
+export interface PersonalizationInput {
+  company: CompanyRecord;
+  contact?: PersonRecord;
+  campaign: {
+    /** What the email is trying to achieve. */
+    objective: string;
+    /** Why the recipient should care — the core pitch. */
+    valueProposition: string;
+    /** Low-pressure ask at the end of the email. */
+    callToAction: string;
+  };
+  icp: {
+    industry?: string;
+    employeeRange?: { min?: number; max?: number };
+    description?: string;
+  };
+  /**
+   * Optional signal context from the WHY NOW layer.
+   * When present, the AI uses these signals to write a more specific,
+   * event-driven message rather than relying solely on company metadata.
+   */
+  signalContext?: {
+    whyNow: string;
+    /** AI-generated score 0-100. ANALYTICAL ESTIMATE — not commercially validated. */
+    opportunityScore: number;
+    relevantSignals: string[];
+  };
+}
+
+/** Structured personalization verdict — mirrors QualificationResult's contract. */
+export interface PersonalizationResult {
+  /** Email subject line. */
+  subject: string;
+  /** Email body — 3–5 sentences, plain text. */
+  message: string;
+  /** Tone chosen by the model. */
+  tone: string;
+  /** 0-1 self-reported confidence the message will resonate. */
+  confidence: number;
+  // Observability (satisfies AITaskResult contract):
+  model: string;
+  personalizedAt: string;
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
 /** A normalized person/contact record (minimal for now; expands in Stage 6). */
 export interface PersonRecord {
   fullName: string;

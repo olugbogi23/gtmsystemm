@@ -9,7 +9,8 @@ export type TaskType =
   | "personalization"     // Personalised opening lines (line_1)
   | "reply_classify"      // Classify inbound replies: interested / not-interested / auto-reply
   | "text_normalize"      // Name / title cleaning and normalisation
-  | "campaign_strategy";  // Deep strategic output — campaign plans, lead magnets
+  | "campaign_strategy"   // Deep strategic output — campaign plans, lead magnets
+  | "signal_intelligence";// WHY NOW analysis — synthesize signals into timing rationale
 
 // ── Separation of concerns ───────────────────────────────────────────────────
 //
@@ -38,7 +39,7 @@ export const PROVIDER_TIERS: Record<ProviderName, Record<ComplexityHint, string>
     high: "claude-opus-4-8",
   },
   openrouter: {
-    low: "anthropic/claude-haiku-4-5-20251001",
+    low: "anthropic/claude-haiku-4.5",   // OpenRouter uses dot notation
     medium: "anthropic/claude-sonnet-4-6",
     high: "anthropic/claude-opus-4-8",
   },
@@ -98,6 +99,11 @@ const ROUTES: Record<TaskType, RouteConfig> = {
   text_normalize: {
     provider: "openrouter",
     defaultComplexity: "low",          // Haiku — deterministic text transform
+    fallbackProviders: ["anthropic-direct"],
+  },
+  signal_intelligence: {
+    provider: "openrouter",
+    defaultComplexity: "medium",       // Sonnet — signal synthesis + timing rationale
     fallbackProviders: ["anthropic-direct"],
   },
 };

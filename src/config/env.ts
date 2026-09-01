@@ -37,6 +37,8 @@ export const ENV_KEYS = {
   // AI providers — add keys for the providers you want active.
   // AnthropicDirectProvider: guaranteed JSON schema, no gateway markup, native thinking.
   anthropicApiKey: "ANTHROPIC_API_KEY",
+  /** Required when using an identity-linked Anthropic API key. Find it in console.anthropic.com → Settings → Workspaces. */
+  anthropicWorkspaceId: "ANTHROPIC_WORKSPACE_ID",
   // OpenRouterProvider: 300+ models through one key, cross-provider fallbacks.
   openrouterApiKey: "OPENROUTER_API_KEY",
   openaiApiKey: "OPENAI_API_KEY",
