@@ -47,6 +47,9 @@ export const ENV_KEYS = {
   exaApiKey: "EXA_API_KEY",
   parallelApiKey: "PARALLEL_AI_API_KEY",
   getleadsApiKey: "GETLEADS_API_KEY",
+  // Signal providers
+  predictleadsApiKey: "PREDICTLEADS_API_KEY",
+  predictleadsApiToken: "PREDICTLEADS_API_TOKEN",
 } as const;
 
 export type EnvKey = (typeof ENV_KEYS)[keyof typeof ENV_KEYS];
