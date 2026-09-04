@@ -298,6 +298,24 @@ priority_score (account_intelligence)             ← Stage 14, decays daily
 
 ---
 
+## Migration 0015 — signals_rls (Stage 16)
+
+**File:** `0015_signals_rls.sql`
+
+**What changed:** Enabled Row Level Security on the `signals` table.
+
+**Why:** Supabase flagged `signals` as a critical security issue — it was the ONLY table with `rowsecurity=false`. All 20 other tables have RLS enabled. This migration closes the gap so that all 21 tables share the same baseline protection.
+
+**Tables affected:** `signals` (no schema change, only security posture change)
+
+**Key design decisions:**
+- No policies added — service_role bypasses RLS unconditionally; all existing queries work unchanged
+- The anon/publishable key now correctly cannot access signals without an explicit policy
+- Future policy: once authenticated user flows are added, a `USING (client_id = auth.jwt()->'app_metadata'->>'client_id')` policy should be added for tenant isolation
+- This migration is idempotent — re-running it on a table where RLS is already enabled is a no-op in PostgreSQL
+
+---
+
 ## Tables Created Outside Migrations
 
 The following tables appear to exist in the live database but have no migration files in this repository. They were likely created via the Supabase Dashboard.
@@ -333,3 +351,5 @@ These tables are documented in the individual table files (04-COMPANIES.md throu
 | 0011 | signals | GTM Signal Engine |
 | 0012 | account_intelligence | Opportunity score per (client, company) |
 | 0013 | priority_score + prioritized_at on account_intelligence | Time-decayed account prioritization |
+| 0014 | campaigns.client_id + composite FK + contact_suppression | Campaign tenant isolation + suppression gate |
+| 0015 | signals RLS enabled | Baseline protection aligned with all other tables |

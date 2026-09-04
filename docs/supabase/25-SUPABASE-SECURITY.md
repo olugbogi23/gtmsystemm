@@ -45,29 +45,35 @@ All tables have RLS enabled via `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`. How
 | lists | Yes | service_role grants only | No |
 | list_members | Yes | service_role grants only | No |
 | contacts | Yes | service_role grants only | No |
-| signals | **No** | None | No — see FINDING 1 |
+| signals | **Yes (Migration 0015)** | None yet | No — policies pending auth/tenant mapping |
 | enrichment_runs | Yes (0007+) | service_role grants only | No |
 | jobs | Yes (in code) | service_role grants only | No |
 | campaigns | Unknown (pre-migration) | None | No |
 | campaign_leads | Unknown (pre-migration) | None | No |
 
-### FINDING 1: signals table has no `ENABLE ROW LEVEL SECURITY`
+### FINDING 1: signals table had no `ENABLE ROW LEVEL SECURITY` — RESOLVED
 
-**PROBLEM:** Migration `0011_signals.sql` does not include `ALTER TABLE public.signals ENABLE ROW LEVEL SECURITY`. Every other table created in migrations 0002–0010 explicitly enables RLS.
+**PROBLEM:** Migration `0011_signals.sql` did not include `ALTER TABLE public.signals ENABLE ROW LEVEL SECURITY`. Every other table created in migrations 0002–0010 explicitly enables RLS.
 
 **WHY IT MATTERS:** The signals table stores client-specific buying intelligence — which companies a client is targeting, what signals they're watching. If RLS were to be enforced in the future (e.g., if an anon key were used), the signals table would be world-readable.
 
-**CURRENT STATE:** This is a latent risk only. No anon key is used; service_role bypasses RLS regardless. The data is not exposed right now.
+**CURRENT STATE:** **RESOLVED in Stage 16 (Migration 0015).** RLS was confirmed disabled on `signals` (the only table with `rowsecurity=false`). Supabase flagged this as a critical security issue. RLS has now been enabled. No policies are defined; service_role still has full access.
 
-**RECOMMENDED FIX:**
+**FIX APPLIED:**
 ```sql
 ALTER TABLE public.signals ENABLE ROW LEVEL SECURITY;
 ```
-This is a one-line, safe, non-breaking change that aligns signals with every other table's baseline protection.
 
-**WHAT COULD BREAK:** Nothing. Enabling RLS on a table does not add restrictions by itself. The service_role key bypasses it. No queries will fail.
+**WHAT BROKE:** Nothing. Service_role bypasses RLS. All existing queries continue to work. The anon/publishable key now correctly cannot read signals (no policies defined = deny by default for non-service-role access).
 
-> **STATUS: Do not apply without explicit confirmation.** Document only.
+> **STATUS: RESOLVED.** Migration 0015 applied on 2026-09-04.
+>
+> **Next step for full tenant isolation:** Once authenticated user flows are implemented, add a policy such as:
+> ```sql
+> CREATE POLICY "clients see own signals"
+>   ON public.signals FOR ALL TO authenticated
+>   USING (client_id = auth.jwt()->'app_metadata'->>'client_id');
+> ```
 
 ---
 
@@ -170,7 +176,7 @@ If `SUPABASE_SERVICE_ROLE_KEY` were exposed:
 |------|--------|
 | API key handling | Good — env vars, gitignored |
 | No anon key in use | Good — backend-only system |
-| RLS enabled | Good — except signals table (FINDING 1) |
+| RLS enabled | Good — all 21 tables now have RLS enabled (FINDING 1 resolved in Stage 16) |
 | Tenant isolation | Good — code-level, confirmed by integration test |
 | Data in transit | Good — Supabase API is HTTPS only |
 | Secret logging | Good — no logging of credentials found |
