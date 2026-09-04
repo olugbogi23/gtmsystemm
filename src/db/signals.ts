@@ -166,11 +166,24 @@ export async function getSignalsByClient(
 }
 
 /**
+ * Return value of expireStaleSignals.
+ * affectedCompanyIds lists companies whose active signal set changed — the
+ * caller (signal-ingestion, Step 6) uses these to trigger score recomputation.
+ */
+export interface ExpireResult {
+  count: number;
+  affectedCompanyIds: string[];
+}
+
+/**
  * Mark signals as "expired" when their expires_at has passed.
  * Safe to run repeatedly — only touches active signals past their deadline.
- * Returns the number of rows updated.
+ *
+ * Returns { count, affectedCompanyIds } so the caller knows which companies
+ * had signals expire and can trigger opportunity score recomputation for those
+ * companies only (rather than rescoring the entire client portfolio).
  */
-export async function expireStaleSignals(clientId: string): Promise<number> {
+export async function expireStaleSignals(clientId: string): Promise<ExpireResult> {
   const now = new Date().toISOString();
   const { data, error } = await getSupabaseAdmin()
     .from(TABLE)
@@ -178,10 +191,12 @@ export async function expireStaleSignals(clientId: string): Promise<number> {
     .eq("client_id", clientId)
     .eq("status", "active")
     .lt("expires_at", now)
-    .select("id");
+    .select("id, company_id");
 
   if (error) throw new Error(`expireStaleSignals failed: ${error.message}`);
-  return (data as { id: string }[]).length;
+  const rows = data as { id: string; company_id: string }[];
+  const affectedCompanyIds = [...new Set(rows.map((r) => r.company_id))];
+  return { count: rows.length, affectedCompanyIds };
 }
 
 /**

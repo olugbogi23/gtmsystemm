@@ -260,14 +260,14 @@ async function main(): Promise<void> {
 
   if (normalizedSignals.length > 0) {
     const sample = normalizedSignals[0];
-    const freshness = computeFreshnessScore(sample.occurredAt, detectedAt);
-    const expired = isExpired(sample);
+    const freshness = computeFreshnessScore(sample.occurredAt, sample.expiresAt);
+    const expired = isExpired(sample.expiresAt);
     note("sample_signal_type", sample.signalType);
     note("sample_occurred_at", sample.occurredAt);
     note("sample_expires_at", sample.expiresAt);
     note("sample_freshness_score", freshness);
     note("sample_is_expired", expired);
-    check("freshness score in 0–1 range", freshness >= 0 && freshness <= 1);
+    check("freshness score in 0–100 range", freshness >= 0 && freshness <= 100);
     check("sample signal is not expired", !expired);
   } else {
     console.log("  (no signals to spot-check)");
@@ -281,22 +281,51 @@ async function main(): Promise<void> {
   check("all batch events carry correct clientId", wrongClientEvents.length === 0,
     wrongClientEvents.length > 0 ? `${wrongClientEvents.length} events had wrong clientId` : undefined);
 
-  // Query the signals table to confirm all inserted rows have client_id = TEST_CLIENT_ID
+  // Verify tenant isolation in DB using two bounded queries:
+  //   1. Sample check — verify a small number of known IDs all have client_id = TEST_CLIENT_ID.
+  //   2. Contamination check — verify no signals for our companies exist under a DIFFERENT client_id.
+  // Avoids a single .in(3202 UUIDs) call which would exceed PostgREST URL limits.
   if (insertedRows.length > 0) {
-    const insertedIds = insertedRows.map((r) => r.id);
-    const { data: dbRows, error: dbErr } = await db
+    const SAMPLE_SIZE = 10;
+    const sampleIds = insertedRows.slice(0, SAMPLE_SIZE).map((r) => r.id);
+
+    // 1. Sample check: a bounded .in() with ≤10 IDs.
+    const { data: sampleRows, error: sampleErr } = await db
       .from("signals")
       .select("id, client_id")
-      .in("id", insertedIds);
-    if (dbErr) {
-      check("tenant isolation DB query succeeded", false, dbErr.message);
+      .in("id", sampleIds);
+    if (sampleErr) {
+      check("tenant isolation sample query succeeded", false, sampleErr.message);
     } else {
-      const wrongClientRows = (dbRows as Array<{ id: string; client_id: string }>)
+      const wrongSample = (sampleRows as Array<{ id: string; client_id: string }>)
         .filter((r) => r.client_id !== TEST_CLIENT_ID);
       check(
-        "all inserted rows in DB have correct client_id",
-        wrongClientRows.length === 0,
-        wrongClientRows.length > 0 ? `${wrongClientRows.length} rows have wrong client_id` : undefined,
+        `sample of ${SAMPLE_SIZE} inserted rows all have correct client_id`,
+        wrongSample.length === 0,
+        wrongSample.length > 0 ? `${wrongSample.length} rows had wrong client_id` : undefined,
+      );
+    }
+
+  }
+
+  // 2. Contamination check: count signals for our 4 test companies under ANY OTHER client.
+  //    Runs on every execution (including re-runs) to prove isolation is maintained in DB.
+  {
+    const testCompanyIds = Array.from(companyDomains.keys());
+    const { count: contaminatedCount, error: contamErr } = await db
+      .from("signals")
+      .select("id", { count: "exact", head: true })
+      .in("company_id", testCompanyIds)
+      .neq("client_id", TEST_CLIENT_ID);
+    if (contamErr) {
+      check("tenant isolation contamination query succeeded", false, contamErr.message);
+    } else {
+      check(
+        "no signals for test companies exist under a different client_id",
+        (contaminatedCount ?? 0) === 0,
+        contaminatedCount != null && contaminatedCount > 0
+          ? `${contaminatedCount} contaminated rows found`
+          : undefined,
       );
     }
   }

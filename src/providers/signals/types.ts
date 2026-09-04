@@ -18,6 +18,13 @@ export interface FetchOptions {
   limit?: number;
   /** Only return events after this ISO timestamp. */
   since?: string;
+  /**
+   * Map of companyId (our UUID) → bare domain.
+   * Required by PredictLeads; ignored by providers that identify by ID.
+   * Declared here so the coordinator can pass it through FetchOptions
+   * without a type cast — PredictLeadsFetchOptions overrides this as required.
+   */
+  companyDomains?: Map<string, string>;
 }
 
 export interface SignalProvider {

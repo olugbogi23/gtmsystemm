@@ -128,3 +128,22 @@ export async function storeCompaniesInList(
 
   return { inserted, existing };
 }
+
+/**
+ * Fetch the icp_score for a company.
+ * Returns 0 when the company has not been qualified yet (null column value),
+ * matching the scoring engine's treatment of an unset ICP score.
+ *
+ * icp_score is global — shared across all clients targeting the same company.
+ * See the TEMPORARY COMPROMISE note in src/lib/opportunity-scoring.ts and
+ * the account_intelligence migration (0012_account_intelligence.sql).
+ */
+export async function getCompanyIcpScore(companyId: string): Promise<number> {
+  const { data, error } = await getSupabaseAdmin()
+    .from("companies")
+    .select("icp_score")
+    .eq("id", companyId)
+    .single();
+  if (error) throw new Error(`getCompanyIcpScore failed: ${error.message}`);
+  return (data as { icp_score: number | null }).icp_score ?? 0;
+}

@@ -69,3 +69,30 @@ Canonical linear flow (see `docs/roadmap.md` for the full stage→skill table an
 - The `SKILL.md` `description` field is what makes a skill discoverable/invocable — write it as an explicit "use this when…" so Claude picks the right skill. Keep it aligned with the entries in `README.md` and `docs/roadmap.md`, which double as the human-facing skill index.
 - Skills that spend real money (buying domains, sending) or upload to a platform must confirm with the user first and default to non-destructive (e.g. `smartlead-campaign-upload-public` always uploads as DRAFT; the user hits Start manually). Preserve these safeguards.
 - Reference-only skills (`smartlead-api`, `prospeo-search-api`, `smartlead-spintax`) are documentation surfaces with no scripts — they exist so Claude has the API/format details inline.
+
+## Supabase Documentation Rule
+
+`docs/supabase/` contains a permanent, validated documentation system for the Supabase database. **Before any database work in a new conversation, read `docs/supabase/00-START-HERE.md` and the relevant table file(s).** This saves you from re-deriving the schema from migrations and TypeScript interfaces every session.
+
+**When to update these docs:**
+- A new migration is applied → update `99-SUPABASE-CHANGELOG.md` + the affected table file(s)
+- A table schema changes (column added, type changed) → update the corresponding `NN-TABLENAME.md` file
+- A new table is created → create a new table doc in the 13-section format used by existing table files
+- A security finding is discovered → document it in `25-SUPABASE-SECURITY.md` using the PROBLEM/WHY IT MATTERS/CURRENT STATE/RECOMMENDED FIX/WHAT COULD BREAK format, then STOP and ask before changing any policy
+
+**Critical security constraints that apply when working with Supabase:**
+- API secrets must NEVER be logged
+- Do NOT connect Smartlead / send emails / trigger outbound
+- Do not automatically change security policies while documenting
+- If you discover a security issue: document it in `25-SUPABASE-SECURITY.md`, then stop and ask before changing production security configuration
+
+**File map:**
+- `00-START-HERE.md` — architecture overview, 19 tables at a glance, data flow
+- `01-DATABASE-MAP.md` — full relational map with ASCII tree
+- `02` to `20` — one file per table (13-section format)
+- `21-CAMPAIGN-DATA-FLOW.md` — complete pipeline trace (idea → inbox)
+- `22-FOLLOW-A-COMPANY.md` — single company traced through all tables
+- `23-FOLLOW-A-CAMPAIGN.md` — single campaign traced from idea to results
+- `24-SUPABASE-CONCEPTS.md` — how Supabase works (6 progressive levels)
+- `25-SUPABASE-SECURITY.md` — RLS status, security findings, data classification
+- `99-SUPABASE-CHANGELOG.md` — migration history and schema evolution
