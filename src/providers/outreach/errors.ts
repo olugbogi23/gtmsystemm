@@ -18,8 +18,9 @@ export class OutreachProviderError extends Error {
 }
 
 export class OutreachCredentialError extends OutreachProviderError {
-  constructor(provider: string) {
-    super(`${provider}: missing or invalid API credentials`, provider);
+  constructor(provider: string, detail?: string) {
+    const suffix = detail ? ` — ${detail}` : "";
+    super(`${provider}: missing or invalid API credentials${suffix}`, provider);
     this.name = "OutreachCredentialError";
   }
 }

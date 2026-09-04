@@ -244,7 +244,8 @@ export class SmartleadAdapter implements OutreachProvider {
 
   private _url(path: string): string {
     const sep = path.includes("?") ? "&" : "?";
-    return `${path}${sep}api_key=${this.creds.apiKey}`;
+    // Trim to guard against whitespace in env vars
+    return `${path}${sep}api_key=${this.creds.apiKey.trim()}`;
   }
 
   private async _get<T>(
@@ -270,7 +271,16 @@ export class SmartleadAdapter implements OutreachProvider {
       }
 
       if (resp.status === 401 || resp.status === 403) {
-        throw new OutreachCredentialError("smartlead");
+        // Read the body so the error message includes the API's own reason (e.g. "Plan expired!")
+        const apiMsg = await resp.text().catch(() => "");
+        let detail = "";
+        try {
+          const parsed = JSON.parse(apiMsg) as Record<string, unknown>;
+          detail = typeof parsed.message === "string" ? parsed.message : apiMsg;
+        } catch {
+          detail = apiMsg;
+        }
+        throw new OutreachCredentialError("smartlead", detail.slice(0, 120) || undefined);
       }
 
       if (resp.status === 404) {
