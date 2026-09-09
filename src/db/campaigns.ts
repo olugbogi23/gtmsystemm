@@ -34,7 +34,22 @@ const TABLE = "campaigns" as const;
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
-export type CampaignStatus = "draft" | "active" | "paused" | "completed" | "archived";
+/**
+ * Live DB CHECK constraint (campaigns_status_check) allows:
+ *   draft | review | ready | running | paused | completed | cancelled
+ *
+ * Corrected in Stage 18 after live schema inspection found the TypeScript type
+ * did not match the database constraint. "active" and "archived" were never
+ * valid DB values — the DB uses "running" and "cancelled" respectively.
+ */
+export type CampaignStatus =
+  | "draft"
+  | "review"
+  | "ready"
+  | "running"
+  | "paused"
+  | "completed"
+  | "cancelled";
 
 export interface CampaignRow {
   id:                 string;
@@ -214,4 +229,29 @@ export async function deleteCampaign(
     .eq("id",        campaignId);
 
   if (error) throw new Error(`deleteCampaign failed: ${error.message}`);
+}
+
+/**
+ * Returns true when a contact is already enrolled in a campaign.
+ *
+ * Checks the campaign_leads table for UNIQUE(campaign_id, contact_id).
+ * A contact enrolled with any status ('ready', 'sent', 'replied', etc.)
+ * is considered enrolled — re-enrollment is blocked regardless of lead status.
+ *
+ * READ ONLY — Stage 17. No writes to campaign_leads until Stage 18+.
+ */
+export async function isContactEnrolledInCampaign(
+  campaignId: string,
+  contactId:  string,
+): Promise<boolean> {
+  const { data, error } = await getSupabaseAdmin()
+    .from("campaign_leads")
+    .select("id")
+    .eq("campaign_id", campaignId)
+    .eq("contact_id",  contactId)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw new Error(`isContactEnrolledInCampaign failed: ${error.message}`);
+  return data !== null;
 }

@@ -316,6 +316,40 @@ priority_score (account_intelligence)             ← Stage 14, decays daily
 
 ---
 
+## Migration 0016 — health_snapshots (Stage 18)
+
+**File:** `0016_health_snapshots.sql`
+
+**Applied:** 2026-09-04
+
+**What changed:** Created three append-only health snapshot tables for outreach provider metrics:
+
+1. **`campaign_health_snapshots`** — point-in-time campaign send/open/reply/bounce metrics from a provider API. Composite FK `(client_id, campaign_id) → campaigns(client_id, id) ON DELETE CASCADE` enforces client_id integrity at the DB level (snapshots cascade-delete when the campaign is deleted).
+
+2. **`domain_health_snapshots`** — per-domain inbox aggregate (total inboxes, healthy inboxes, blocked inboxes) from a provider API.
+
+3. **`inbox_health_snapshots`** — per-inbox warmup/SMTP/IMAP health state, with tags array and daily send counts.
+
+**Why:** Stage 18 introduced the Health Snapshot system to enable passive health monitoring. Each snapshot is a frozen point-in-time read from the outreach provider — no writes, no side effects. Baselines let us detect regressions: when `bounceRatePct` exceeds the baseline by more than `BOUNCE_RATE_WARN_PCT = 3.0%` (INITIAL_HYPOTHESIS_NOT_VALIDATED), or `replyRatePct` drops by more than `REPLY_RATE_DROP_WARN_PCT = 2.0%` (INITIAL_HYPOTHESIS_NOT_VALIDATED), a `HealthConcern` is emitted.
+
+**New tables:** `campaign_health_snapshots`, `domain_health_snapshots`, `inbox_health_snapshots`
+
+**Key design decisions:**
+- **Append-only:** No UPDATE or DELETE in the application layer (only cascade-deletes at DB level when parent campaign/client is deleted)
+- **Baseline = first snapshot:** The first row per `(client_id, entity_id)` is marked `is_baseline=true`. Determined application-side before insert (not a DB trigger). Concurrent races are benign — snapshots run on a scheduled cadence.
+- **Idempotency:** `ON CONFLICT (client_id, entity_id, taken_at) DO NOTHING` — re-run within same second = no-op, returns `null` to caller (not an error).
+- **Client isolation:** All reads include `.eq("client_id", clientId)`. Campaign snapshots additionally use the composite FK at the DB level.
+- **RLS enabled** on all three tables. No policies defined — service_role bypasses RLS; anon key has no access.
+- **`entity_id` column:** A stable text identifier for the snapshot entity (campaign UUID, domain name, or inbox platform ID). The composite unique constraint on `(client_id, entity_id, taken_at)` drives idempotency.
+- **All thresholds labelled INITIAL_HYPOTHESIS_NOT_VALIDATED** — `BOUNCE_RATE_WARN_PCT=3.0`, `REPLY_RATE_DROP_WARN_PCT=2.0`, `INBOX_BLOCK_RATE_WARN_PCT=25.0`, `EMAIL_VERIFICATION_STALENESS_DAYS=90`. None validated against campaign outcome data.
+
+**Tables affected:**
+- `campaign_health_snapshots` (new — RLS + cascade FK + 3 indexes)
+- `domain_health_snapshots` (new — RLS + 3 indexes)
+- `inbox_health_snapshots` (new — RLS + 3 indexes)
+
+---
+
 ## Tables Created Outside Migrations
 
 The following tables appear to exist in the live database but have no migration files in this repository. They were likely created via the Supabase Dashboard.
@@ -331,6 +365,266 @@ The following tables appear to exist in the live database but have no migration 
 | `list_members` | `src/db/companies.ts`; no migration file | List→company/contact junction |
 
 These tables are documented in the individual table files (04-COMPANIES.md through 08-LIST-MEMBERS.md) based on TypeScript interface inspection.
+
+---
+
+## Application Layer Additions (No Migration Required)
+
+The following application-layer modules were added in Stage 19A. They operate against existing tables and require no schema changes.
+
+### Stage 19A — Lead Supply & Enrollment Readiness
+
+**Files added:**
+- `src/db/list-contacts.ts` — Batched DB reads: `getContactsForList` (Path A + Path B, dedup), `getAccountIntelligenceMap`, `getLatestEmailVerificationMap`, `getSuppressionMap`, `getEnrolledContactIds`. All read-only, no N+1 patterns.
+- `src/lib/lead-supply.ts` — Pure types (`ContactAssessment`, `LeadSupplyReport`, `LeadSupplyInput`) + pure functions (`assessContactForCampaign`, `buildLeadSupplyReport`) + async orchestrator (`assessCampaignLeadSupply`). ~10 batched queries regardless of list size.
+- `src/__tests__/lead-supply.test.ts` — 60 pure unit tests covering all five gates, all campaign statuses, FINDING 5 warning, breakdownByReason, dedup, client isolation, health advisories.
+- `scripts/lead-supply-integration-test.ts` — 61 live integration checks against Gramscode test client. Creates and fully cleans up synthetic test fixtures. Full regression: 879/879.
+
+**FINDING 5 documented (not resolved):**
+`lists` and `list_members` have no `client_id`. There is no DB-level guarantee that `campaigns.list_id` references a list built for the same client. The `LeadSupplyReport.listClientWarning` field documents this gap on every report where `listId` is non-null. The account gate (Gate 1) provides a soft mitigation — contacts for companies with no `account_intelligence` for the client fail with `NO_ACCOUNT_INTELLIGENCE`. A schema fix (adding `client_id` to `lists` + `list_members`, or a junction table) requires explicit approval and a new migration.
+
+**What Stage 19A does NOT do:**
+- No writes to `campaign_leads`
+- No email sends or provider API calls
+- No migrations or RLS changes
+- Does not resolve FINDING 5
+
+---
+
+## Application Layer Additions — Stage 20 (No Migration Required)
+
+**Completed:** 2026-09-05
+
+Stage 20 implements the provider lead upload path: takes `campaign_leads` rows with `status='ready'`, submits them to the Smartlead API, and transitions them to `status='uploaded'`. No new tables, no new columns, no migration. All changes are in the application layer.
+
+### Files added / modified
+
+| File | Change |
+|------|--------|
+| `src/db/campaign-leads.ts` | Added `getReadyLeadsForUpload` (reads `status='ready'` rows, oldest-first) and `markLeadsUploaded` (transitions rows with `status='ready'` guard) |
+| `src/lib/lead-upload.ts` | `uploadCampaignLeads()` orchestrator — 3-gate precondition check (platform, status, platformCampaignId), batch-100 provider loop, crash-recovery idempotency |
+| `src/providers/outreach/smartlead.ts` | `uploadLeads()` method — POST to `/api/v1/campaigns/{id}/leads`; response interface extended with `already_added_to_campaign` |
+| `src/__tests__/lead-upload.test.ts` | Unit tests for the orchestrator (pure, no network) |
+| `src/__tests__/outreach-provider.test.ts` | 14 `uploadLeads` unit tests added; 40 total, all passing |
+
+### Critical API contract discovery: `ignore_duplicate` is invalid
+
+The Stage 20 design assumed `?ignore_duplicate=true` was a valid Smartlead query parameter. Live testing confirmed it is **not valid** — Smartlead returns HTTP 400: `"ignore_duplicate" is not allowed`. The parameter was removed from the adapter. Smartlead handles campaign dedup natively.
+
+**Correct field: `already_added_to_campaign`**
+
+Smartlead's upload response includes two distinct dedup counters:
+
+| Field | Meaning |
+|-------|---------|
+| `already_added_to_campaign` | Per-campaign dedup — non-zero when a lead is already in this specific campaign. This is the authoritative idempotency signal. Mapped to `duplicateCount` internally. |
+| `duplicate_count` | Global suppression/unsubscribe counter — leads blocked by global lists. Different concept from campaign-level dedup. |
+
+### `platform_lead_id` confirmed NULL after upload
+
+Smartlead's `POST /campaigns/{id}/leads` returns aggregate counts only, no per-lead IDs. `campaign_leads.platform_lead_id` remains NULL. Backfill via `GET /campaigns/{id}/leads` is deferred to Stage 21+.
+
+### Concurrency model (Stage 20)
+
+Single-worker. No `uploading` claim status yet. Crash-recovery: if the process crashes after a successful provider call but before `markLeadsUploaded`, the row stays `ready`. On retry, Smartlead returns `already_added_to_campaign=1` (not an error); `markLeadsUploaded` then runs and advances the row to `uploaded`. The `WHERE status='ready'` guard in `markLeadsUploaded` prevents double-write.
+
+### Open findings (unchanged from Stage 19B)
+
+- **FINDING 5**: `lists` and `list_members` have no `client_id` — cross-client list isolation gap. Not resolved.
+- **FINDING 6**: `campaign_leads` has RLS enabled but zero policies — service_role bypasses; no impact today. Not resolved.
+
+### Test evidence (live Gramscode test, 2026-09-05)
+
+| Phase | Result |
+|-------|--------|
+| Dry run | 5-gate pass, readyCount=1, 0 provider calls, 0 DB writes |
+| Live upload (pre-fix) | HTTP 400 from `?ignore_duplicate=true`; row stayed `ready` (correct failure recovery) |
+| Adapter fix | `ignore_duplicate` removed; `already_added_to_campaign` mapped; 968/968 regression pass |
+| Reconciliation call | Smartlead: `upload_count=1, already_added_to_campaign=1`; DB: `ready → uploaded`; `updated_at` advanced |
+| Idempotency rerun | 0 provider POSTs; `readyCount=0`; DB unchanged; campaign remained DRAFTED |
+| Supabase independent verification | campaign_lead count=1, uploaded=1, ready=0, campaign_status=draft — PASSED |
+
+---
+
+## Migration 0017 — why_now (Stage 22)
+
+**File:** `0017_why_now.sql`
+
+**What changed:**
+
+Three additive columns on `account_intelligence`:
+
+- `why_now JSONB` — Full `WhyNowAssessment` blob: deterministic evidence snapshot (signal summaries, corroboration factor, opportunity/priority scores), readiness decision, and optional AI narrative grounded in actual stored signal evidence. Null until first `assessWhyNow()` run.
+- `is_ready BOOLEAN` — Promoted from `why_now->ready` for fast indexed filtering. Null = not yet assessed. False = assessed but insufficient evidence. True = passes readiness gate.
+- `readiness_assessed_at TIMESTAMPTZ` — When the readiness gate was last evaluated. NOT a freshness guarantee — new signals ingested after this timestamp may change readiness.
+
+Partial index `account_intelligence_ready_priority_idx` on `(client_id, priority_score DESC NULLS LAST) WHERE is_ready = true` — fast filtering of ready accounts ordered by priority.
+
+**Why:** Stage 22 Why Now Engine. Answers "why should we reach out to this company right now?" using a three-stage pipeline: deterministic evidence assembly from stored signals → readiness gate → optional AI narrative. The AI system prompt explicitly prohibits inventing facts not in evidence.
+
+**Tables affected:** `account_intelligence` (additive only — no existing columns modified)
+
+**Key design decisions:**
+- All readiness thresholds are `INITIAL_HYPOTHESIS_NOT_VALIDATED` (minOpportunityScore=1, minActiveSignalCount=1, aiNarrativeMinScore=20)
+- `is_ready` is promoted to a native column for fast indexed queries (avoids JSONB extraction on hot paths)
+- AI narrative is gated: only generated when `ready=true` AND `opportunity_score >= 20`. AI failures are non-fatal (narrative=null, deterministic assessment still persisted)
+- 23-hour idempotency window: existing narratives reused within the window to prevent duplicate AI spend
+- Signal UUIDs embedded in `evidence._signalId`; AI returns signal titles; post-mapping maps titles → UUIDs (best-effort)
+- File was originally numbered 0014 — renamed to 0017 before application (0014 was already taken by Stage 15 campaign operations migration)
+
+**Test results (applied 2026-09-06):**
+| Check | Result |
+|-------|--------|
+| Unit tests | 55/55 pass |
+| Regression suite | 1063/1063 pass |
+| Company A (1 funding signal, score=32) | ready=true, persisted, reason=READY |
+| Company B (expired signal, score=0) | ready=false, reason=OPPORTUNITY_SCORE_BELOW_THRESHOLD |
+| Company C (no account_intelligence row) | ready=false, not persisted, reason=NO_ACCOUNT_INTELLIGENCE |
+| Company D (3 GROWTH signals, score=100) | ready=true, AI narrative generated (14180ms, $0.009) |
+| Corroboration (Company D) | factor=1.3 (3-type GROWTH cluster confirmed) |
+| Idempotency | Second run within 23h: narrativeReused=true, no AI call made |
+| Client isolation | Cross-client lookup returns NO_ACCOUNT_INTELLIGENCE; real row unchanged |
+| getReadyAccounts() | Returns Company A and D only; excludes B (not ready) and C (not assessed) |
+
+---
+
+## Migration 0018 — contact_intelligence (Stage 23)
+
+**File:** `0018_contact_intelligence.sql`
+
+**Applied:** 2026-09-08
+
+**What changed:** Two new tables for Stage 23 Contact Intelligence & Person Relevance:
+
+1. **`contact_intelligence`** — campaign-agnostic, one row per `(client_id, company_id, contact_id)`. Stores deterministic job title classification (`title_classification JSONB`: function bucket, seniority, confidence — raw title intentionally absent for PII minimisation) and a snapshot of the Stage 17 contact eligibility gate (`gate_snapshot JSONB`). Promoted boolean `is_contact_ready` for fast indexed queries. `is_contact_ready` is a **DISCOVERY snapshot** — not authorization for outreach.
+
+2. **`contact_campaign_relevance`** — campaign-specific, one row per `(client_id, company_id, contact_id, campaign_strategy_id)`. Stores the deterministic relevance score (0–100, `NUMERIC(5,2)`) and AI-generated "why this person" sentence. `relevance_reason` has a `CHECK` constraint enforcing the 5 valid values. `scoring_version` promoted from JSONB for fast staleness comparison without JSONB parsing. `is_person_qualified = is_person_relevant AND is_contact_ready (snapshot)` — does NOT imply OUTREACH_READY.
+
+3. **Trigger `contact_campaign_strategy_client_check`** — BEFORE INSERT OR UPDATE on `contact_campaign_relevance`. Verifies `campaign_strategy_id` belongs to the same `client_id`. Compensates for `campaign_strategies` having no `UNIQUE(client_id, id)` constraint — same pattern as migration 0014. Fires for all connections.
+
+**Why:** Stage 23 answers "for an account worth pursuing, who is the right person to contact, and why?" The two-table design separates campaign-agnostic facts (title classification, eligibility gate) from campaign-specific facts (relevance score, AI narrative). The same contact reuses its `contact_intelligence` row across all campaigns.
+
+**New tables:** `contact_intelligence`, `contact_campaign_relevance`
+
+**Key design decisions:**
+- `is_contact_ready` and `is_person_qualified` are **snapshots** — NOT outreach authorization. The activation stage (Stage 24+) must re-run `evaluateContactEligibility()` live.
+- Stage 23 does NOT produce `OUTREACH_READY`. That belongs to a future activation stage.
+- `SCORING_VERSION = "1.0.0"` (INITIAL_HYPOTHESIS_NOT_VALIDATED thresholds: `PERSON_RELEVANCE_MIN_SCORE=30`, `AI_RELEVANCE_MIN_SCORE=40`, staleness ceiling 7 days).
+- All indexes `IF NOT EXISTS`, DDL idempotent throughout.
+- RLS enabled on both tables; no policies yet — service_role bypasses RLS.
+
+**Verification (applied 2026-09-08):**
+| Check | Result |
+|-------|--------|
+| contact_intelligence exists | ✓ |
+| contact_campaign_relevance exists | ✓ |
+| UNIQUE(client,company,contact) on contact_intelligence | ✓ |
+| UNIQUE(client,company,contact,campaign) on contact_campaign_relevance | ✓ |
+| All 8 expected indexes present | ✓ |
+| Trigger contact_campaign_strategy_client_check | ✓ |
+| RLS enabled on both tables | ✓ |
+| All columns match designed schema | ✓ |
+| Unit tests (person-relevance, contact-eligibility) | 1186/1186 pass |
+
+---
+
+## Stage 21B — Controlled First-Send Experiment (CLOSED 2026-09-08)
+
+**No migration required.** Application-layer observation only.
+
+**Experiment:** Single test lead enrolled, campaign manually activated in Smartlead UI. BEFORE snapshot taken before activation; AFTER snapshot taken 2026-09-08 after UI confirmed `Completed, 1/1 sends, 1 opened`.
+
+### Confirmed API field changes after a send
+
+| Source | Field | BEFORE | AFTER |
+|--------|-------|--------|-------|
+| Smartlead campaign object | `status` | `DRAFTED` | `COMPLETED` |
+| Campaign roster | per-lead `status` | `STARTED` | `COMPLETED` |
+| Campaign roster | `sent_at` | `null` | `null` (CRITICAL — not populated) |
+| Global lead | `last_sent_at` | `null` | `2026-09-07T08:01:57.411+00:00` |
+| Global lead | `last_activity_at` | `null` | `2026-09-07T08:01:57.411+00:00` |
+| Analytics | `sent_count` | `0` | `1` |
+| Analytics | `open_count` | `0` | `1` |
+
+### Critical findings
+
+1. **`roster.sent_at` is permanently null** — Smartlead does NOT populate it after a send. Never use it for send detection.
+2. **`global_lead.last_sent_at` is the authoritative send timestamp** — `GET /leads/?email=...` → `lead_campaign_data[].last_sent_at`.
+3. **Status `STARTED → COMPLETED`** confirmed for a fully-sequenced lead (1-step sequence here; INPROGRESS for mid-sequence is unconfirmed).
+4. **`lead_category_id` stays null** through a send event — do not use.
+5. **`contacts.updated_at` exists in live DB** — confirmed by schema probe. TypeScript `ContactRow` type doesn't expose it yet.
+
+Full findings documented in `docs/supabase/19-CAMPAIGN-LEADS.md` § 15.
+
+---
+
+## Stage 23 — Pre-Migration Schema Analysis (2026-09-08)
+
+**Migration 0018 applied 2026-09-08. All checks passed.**
+
+### Live schema findings
+
+1. **`campaign_strategies` has NO `UNIQUE(client_id, id)`** — Only `PRIMARY KEY (id)` and FK to `clients`. Confirmed via `pg_constraint` query. Migration 0018 uses the trigger pattern (same as migration 0014) for client isolation on `contact_campaign_relevance` instead.
+
+2. **Stage 23 tables (`contact_intelligence`, `contact_campaign_relevance`) do NOT yet exist** — `information_schema.tables` query returned empty. Migration 0018 is a clean-slate migration (no existing data to worry about).
+
+3. **`contacts.updated_at` EXISTS as `timestamp with time zone`** — Confirmed. Not yet typed in `ContactRow`. Enables richer staleness detection when the type is updated.
+
+4. **All referenced columns exist** — `campaign_strategies.targeting_level`, `campaign_strategies.value_proposition`, `campaign_strategies.updated_at` all confirmed in live schema.
+
+### Application layer (completed, pending migration)
+
+| File | Status |
+|------|--------|
+| `src/domain/contact-intelligence-types.ts` | Complete |
+| `src/db/contact-intelligence.ts` | Complete |
+| `src/lib/contact-intelligence.ts` | Complete |
+| `src/lib/person-relevance.ts` | Complete |
+| `src/lib/contact-eligibility.ts` | Complete |
+| `src/__tests__/person-relevance.test.ts` | 123/123 pass |
+| `src/__tests__/contact-eligibility.test.ts` | Complete |
+| `supabase/migrations/0018_contact_intelligence.sql` | Prepared, NOT applied |
+
+**Production gate:** Migration 0018 is awaiting explicit approval before application.
+
+---
+
+## Migration 0019 — person_discovery (Stage 24)
+
+**File:** `0019_person_discovery.sql`
+**Applied:** 2026-09-08 via Supabase Management API (Supabase CLI not available)
+
+**What changed:** Created four audit tables for the Stage 24 person discovery and email enrichment waterfalls.
+
+**New tables:**
+
+| Table | Purpose |
+|-------|---------|
+| `person_discovery_runs` | One row per (client, company, campaign_strategy) — the latest waterfall result |
+| `person_discovery_attempts` | One row per provider call within a discovery run |
+| `email_enrichment_runs` | One row per (client, contact, campaign_strategy) — the latest enrichment result |
+| `email_enrichment_attempts` | One row per provider call within an enrichment run |
+
+**Key design decisions:**
+
+- **`found_email` deliberately absent** from `email_enrichment_runs` and `email_enrichment_attempts`. The found email is PII; it is returned in-memory via `EmailEnrichmentOutcome.foundEmail` only and must never be persisted to these tables.
+- **FK ON DELETE behavior:** `selected_contact_id` and `candidate_contact_id` → SET NULL (preserves audit when contact deleted). `contact_id` on email enrichment → CASCADE (contact is the subject; audit is meaningless without the contact). All `client_id`, `company_id`, `campaign_strategy_id` references → RESTRICT (default; prevents orphaned runs).
+- **Idempotency:** Both `*_runs` tables use UNIQUE on `(client_id, company_id/contact_id, campaign_strategy_id)` — upsert on re-run overwrites the run row. Both `*_attempts` tables use UNIQUE on `(run_id, provider_id, attempt_number)` with `ignoreDuplicates: true` — first write wins on re-run.
+- **RLS enabled, zero policies** on all four tables — consistent with the rest of the schema. Access is via `service_role` only.
+- **FK violation observable:** If `client_id` does not exist in `clients` (e.g., test fixture without a real client row), the waterfall wrapper returns `persistenceError: { code: "FK_VIOLATION", message: "..." }` on the outcome instead of silently swallowing the error.
+
+**Application layer added (Stage 24):**
+
+| File | What it does |
+|------|-------------|
+| `src/db/person-discovery.ts` | `upsertPersonDiscoveryRun`, `insertPersonDiscoveryAttempt`, `persistPersonDiscoveryOutcome`, `getPersonDiscoveryRun`, `listPersonDiscoveryAttempts` |
+| `src/db/email-enrichment.ts` | `upsertEmailEnrichmentRun`, `insertEmailEnrichmentAttempt`, `persistEmailEnrichmentOutcome`, `getEmailEnrichmentRun`, `listEmailEnrichmentAttempts` |
+| `src/lib/person-discovery-waterfall.ts` | Public `runPersonDiscoveryWaterfall` wraps `_runPersonDiscoveryCore` + persist. FK violations → `persistenceError` on outcome. |
+| `src/lib/email-enrichment-waterfall.ts` | Same pattern: `runEmailEnrichmentWaterfall` wraps `_runEmailEnrichmentCore` + persist. |
+| `src/lib/provider-error-sanitizer.ts` | 6-pass redaction (email, Bearer, Basic, key=value, prefixed keys, long tokens) — applied before any error message is stored |
+| `src/domain/person-discovery-types.ts` | `PersistenceError` interface + `persistenceError?` field on both outcome types |
+
+**Verified:** 40/40 schema checks (via `scripts/verify-0019-schema.ts`), 112/112 Stage 24 controlled validation, 66/66 Stage 24B persistence integration, 1241/1241 full regression. No emails sent. No campaigns modified. Stage 23 tables unchanged.
 
 ---
 
@@ -353,3 +647,10 @@ These tables are documented in the individual table files (04-COMPANIES.md throu
 | 0013 | priority_score + prioritized_at on account_intelligence | Time-decayed account prioritization |
 | 0014 | campaigns.client_id + composite FK + contact_suppression | Campaign tenant isolation + suppression gate |
 | 0015 | signals RLS enabled | Baseline protection aligned with all other tables |
+| 0016 | campaign/domain/inbox health snapshot tables | Append-only provider health monitoring + baseline regression detection |
+| Stage 19A (no migration) | Lead supply assessment + list-contacts DB layer | Read-only enrollment readiness: 5-gate check across full list, breakdownByReason, health advisories |
+| Stage 20 (no migration) | Provider lead upload — `uploadCampaignLeads()` + `uploadLeads()` adapter | `ready → uploaded` lifecycle; crash-recovery idempotency; `already_added_to_campaign` dedup mapping confirmed live |
+| 0017 | `why_now JSONB` + `is_ready BOOLEAN` + `readiness_assessed_at TIMESTAMPTZ` on `account_intelligence` + partial index | Stage 22 Why Now Engine: deterministic evidence + readiness gate + optional AI narrative grounded in stored signals |
+| Stage 21B (no migration) | Controlled first-send experiment — BEFORE/AFTER snapshots | Confirmed: `roster.sent_at` always null; `global_lead.last_sent_at` is authoritative; status STARTED→COMPLETED |
+| 0018 | `contact_intelligence` + `contact_campaign_relevance` tables + cross-client trigger | Stage 23: title classification + contact eligibility gate snapshot + campaign-specific relevance scoring |
+| 0019 | `person_discovery_runs` + `person_discovery_attempts` + `email_enrichment_runs` + `email_enrichment_attempts` | Stage 24: person discovery + email enrichment waterfall audit trail; found_email never stored |

@@ -62,6 +62,20 @@ export async function listCampaignStrategies(slug: string): Promise<CampaignStra
   return (data ?? []) as CampaignStrategyRow[];
 }
 
+export async function getCampaignStrategyById(
+  id: string,
+  clientId: string,
+): Promise<CampaignStrategyRow | null> {
+  const { data, error } = await getSupabaseAdmin()
+    .from("campaign_strategies")
+    .select("*")
+    .eq("id", id)
+    .eq("client_id", clientId)
+    .maybeSingle();
+  if (error) throw new Error(`getCampaignStrategyById failed: ${error.message}`);
+  return data as CampaignStrategyRow | null;
+}
+
 export async function approveCampaignStrategy(id: string): Promise<void> {
   const { error } = await getSupabaseAdmin()
     .from("campaign_strategies")

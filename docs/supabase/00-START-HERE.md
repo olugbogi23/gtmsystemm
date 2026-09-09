@@ -59,7 +59,7 @@ Every piece of data in the system is scoped to a `client_id`. Gramscode's signal
 
 ---
 
-## The 21 Tables at a Glance
+## The 30 Tables at a Glance
 
 | # | Table | One-line purpose |
 |---|-------|-----------------|
@@ -78,12 +78,21 @@ Every piece of data in the system is scoped to a `client_id`. Gramscode's signal
 | 13 | `email_sequences` | Written email campaign sequences |
 | 14 | `email_sequence_steps` | Individual emails in a sequence (Day 0, 3, 7, 11) |
 | 15 | `signals` | Buying signals detected at target companies |
-| 16 | `account_intelligence` | Derived scoring per (client, company) — opportunity_score + priority_score |
+| 16 | `account_intelligence` | Derived scoring per (client, company) — opportunity_score + priority_score + why_now |
 | 17 | `campaigns` | Active outreach campaigns — client-scoped (client_id added Stage 15) |
 | 18 | `campaign_leads` | Individual leads assigned to a campaign (client_id + composite FK added Stage 15) |
 | 19 | `campaign_reviews` | Client review and approval workflow |
 | 20 | `jobs` | Background task queue for Trigger.dev operations |
 | 21 | `contact_suppression` | Per-client safety gate — prevents suppressed contacts from being enrolled (added Stage 15) |
+| 22 | `campaign_health_snapshots` | Append-only campaign send/open/reply/bounce metrics per snapshot (added Stage 18) |
+| 23 | `domain_health_snapshots` | Append-only domain inbox aggregate (total/healthy/blocked inboxes) per snapshot (added Stage 18) |
+| 24 | `inbox_health_snapshots` | Append-only per-inbox warmup/SMTP/IMAP health state per snapshot (added Stage 18) |
+| 25 | `contact_intelligence` | Campaign-agnostic title classification + eligibility gate snapshot per (client, company, contact) — added Stage 23 |
+| 26 | `contact_campaign_relevance` | Campaign-specific person relevance score + AI narrative per (client, company, contact, campaign_strategy) — added Stage 23 |
+| 27 | `person_discovery_runs` | Most-recent Person Discovery Waterfall result per (client, company, campaign_strategy) — added Stage 24 |
+| 28 | `person_discovery_attempts` | Per-provider attempt history within a person discovery run — added Stage 24 |
+| 29 | `email_enrichment_runs` | Most-recent Email Enrichment Waterfall result per (client, contact, campaign_strategy); found_email never stored — added Stage 24 |
+| 30 | `email_enrichment_attempts` | Per-provider attempt history within an email enrichment run — added Stage 24 |
 
 ---
 
@@ -226,3 +235,5 @@ While all of the above happens, PredictLeads signal ingestion runs via Trigger.d
 - **24-SUPABASE-CONCEPTS.md** — Progressive learning guide (6 levels)
 - **25-SUPABASE-SECURITY.md** — RLS status and security issues
 - **99-SUPABASE-CHANGELOG.md** — Every database change, in order
+
+**Health snapshot tables (Stage 18):** `campaign_health_snapshots`, `domain_health_snapshots`, and `inbox_health_snapshots` are documented in `99-SUPABASE-CHANGELOG.md` migration 0016. Their application layer lives in `src/db/health-snapshots.ts` and `src/lib/health-snapshots.ts`.

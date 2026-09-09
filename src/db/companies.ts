@@ -147,3 +147,35 @@ export async function getCompanyIcpScore(companyId: string): Promise<number> {
   if (error) throw new Error(`getCompanyIcpScore failed: ${error.message}`);
   return (data as { icp_score: number | null }).icp_score ?? 0;
 }
+
+/** Minimal company shape needed for provider payload construction. */
+export interface CompanyNameRow {
+  id:   string;
+  name: string;
+}
+
+/**
+ * Batch-fetch company names by a set of IDs.
+ * Returns a Map<companyId, CompanyNameRow>.
+ * IDs with no matching row are absent from the map.
+ *
+ * Used by Stage 20 lead upload to populate company_name in provider payloads.
+ */
+export async function getCompaniesByIds(
+  companyIds: string[],
+): Promise<Map<string, CompanyNameRow>> {
+  if (companyIds.length === 0) return new Map();
+
+  const { data, error } = await getSupabaseAdmin()
+    .from("companies")
+    .select("id, name")
+    .in("id", companyIds);
+
+  if (error) throw new Error(`getCompaniesByIds failed: ${error.message}`);
+
+  const result = new Map<string, CompanyNameRow>();
+  for (const row of (data as CompanyNameRow[] ?? [])) {
+    result.set(row.id, row);
+  }
+  return result;
+}

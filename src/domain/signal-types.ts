@@ -183,3 +183,117 @@ export interface SignalIntelligenceResult {
   inputTokens?: number;
   outputTokens?: number;
 }
+
+// ── Stage 22: Why Now Engine storable types ───────────────────────────────────
+//
+// These types are stored in account_intelligence.why_now JSONB.
+// They live in domain/ (not lib/) to break the circular dependency between
+// lib/why-now.ts (which imports DB helpers) and db/account-intelligence.ts
+// (which needs WhyNowAssessment for the row type).
+//
+// Operational types (WhyNowPayload, WhyNowResult, WhyNowThresholds, WhyNowOptions)
+// stay in lib/why-now.ts.
+
+/**
+ * Signal summary with UUID for traceability — Stage 22.
+ *
+ * Extends SignalSummary with the signal's DB UUID, enabling post-validation
+ * of AI citations against the actual stored signal rows. Never null.
+ */
+export interface WhyNowSignalSummary extends SignalSummary {
+  /** UUID — traceable to signals.id in the DB. */
+  signalId: string;
+}
+
+/**
+ * Deterministic evidence assembled at Why Now assessment time — Stage 22.
+ *
+ * Computed once from stored signals and account intelligence.
+ * Signal freshness is computed at assessedAt time (decays continuously).
+ * This snapshot captures what was true when assessment ran; call
+ * assessWhyNow() again to refresh it.
+ */
+export interface WhyNowEvidence {
+  /** From account_intelligence.opportunity_score (deterministic, Stage 12). */
+  opportunityScore:    number;
+  /** From account_intelligence.priority_score (Stage 14). Null if not yet computed. */
+  priorityScore:       number | null;
+  /** Signals passing both guards: status=active AND !isExpired(). */
+  activeSignalCount:   number;
+  /** From computeCorroborationFactor() — range 1.0–1.45. */
+  corroborationFactor: number;
+  /** All active signals, with freshness scores computed at assessedAt. */
+  signalSummaries:     WhyNowSignalSummary[];
+  /** Top signals by ICP relevance × actionability (max 10). Used in AI prompt. */
+  topSignals:          WhyNowSignalSummary[];
+  /** ISO — when evidence was collected. */
+  assessedAt:          string;
+}
+
+/**
+ * Machine-readable reason for a readiness decision — Stage 22.
+ * All threshold codes are INITIAL_HYPOTHESIS_NOT_VALIDATED.
+ */
+export type ReadinessReason =
+  | "READY"
+  | "NO_ACCOUNT_INTELLIGENCE"           // No account_intelligence row exists yet
+  | "OPPORTUNITY_SCORE_BELOW_THRESHOLD" // INITIAL_HYPOTHESIS_NOT_VALIDATED
+  | "INSUFFICIENT_ACTIVE_SIGNALS";      // INITIAL_HYPOTHESIS_NOT_VALIDATED
+
+/**
+ * AI-generated Why Now narrative — Stage 22.
+ *
+ * Only generated when: ready=true AND opportunityScore >= AI threshold.
+ * The AI must not invent events — output is grounded in signal evidence
+ * passed in the prompt.
+ *
+ * relevantSignalIds provides UUID traceability back to the signals table.
+ * Mapping is best-effort (title→ID): titles not found in the evidence
+ * set are excluded. Use SELECT * FROM signals WHERE id = ANY(relevantSignalIds)
+ * to verify cited evidence.
+ */
+export interface WhyNowNarrative {
+  /** 1-2 sentences explaining why NOW is the right moment, citing actual signals. */
+  whyNow:               string;
+  /** Signal titles the AI identified as most relevant (from AI response). */
+  relevantSignalTitles: string[];
+  /**
+   * Signal UUIDs mapped from relevantSignalTitles.
+   * Best-effort: titles not found in the evidence set are excluded.
+   * Traceable to signals.id — SELECT * FROM signals WHERE id = ANY(relevantSignalIds).
+   */
+  relevantSignalIds:    string[];
+  /** AI self-reported confidence (0-1). Does NOT block storage when low. */
+  confidence:           number;
+  // Observability
+  model:        string;
+  analyzedAt:   string;
+  inputTokens:  number;
+  outputTokens: number;
+  costUsd:      number | null;
+  latencyMs:    number;
+}
+
+/**
+ * Complete Why Now assessment stored in account_intelligence.why_now JSONB — Stage 22.
+ *
+ * The hypothesis field is always "INITIAL_HYPOTHESIS_NOT_VALIDATED" to document
+ * that readiness thresholds and AI outputs have not been validated against
+ * campaign outcome data. Do not remove or silence this label.
+ */
+export interface WhyNowAssessment {
+  clientId:        string;
+  companyId:       string;
+  ready:           boolean;
+  readinessReason: ReadinessReason;
+  evidence:        WhyNowEvidence;
+  /**
+   * AI narrative. Null when not ready, AI skipped, score below AI threshold,
+   * AI call failed, or existing narrative was reused from idempotency window.
+   */
+  narrative:       WhyNowNarrative | null;
+  /** ISO — when assessWhyNow() was called. */
+  assessedAt:      string;
+  /** Always "INITIAL_HYPOTHESIS_NOT_VALIDATED" — thresholds are unvalidated hypotheses. */
+  hypothesis:      "INITIAL_HYPOTHESIS_NOT_VALIDATED";
+}

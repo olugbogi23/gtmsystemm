@@ -1,16 +1,17 @@
 /**
  * Smartlead outreach provider adapter — Stage 16.
  *
- * READ-ONLY. Does not send emails, pause campaigns, or modify any provider state.
- *
  * ── API contract ──────────────────────────────────────────────────────────────
  *   Base: https://server.smartlead.ai/api/v1
  *   Auth: ?api_key=<key> query parameter on every request
  *
  * ── Endpoints used ────────────────────────────────────────────────────────────
- *   GET /campaigns/{id}/analytics         → getCampaignHealth
- *   GET /email-accounts?offset=&limit=    → getDomainHealth, getInboxHealth (list)
- *   GET /email-accounts/{id}              → getInboxHealth (single)
+ *   GET  /campaigns/{id}/analytics         → getCampaignHealth
+ *   GET  /email-accounts?offset=&limit=    → getDomainHealth, getInboxHealth (list)
+ *   GET  /email-accounts/{id}              → getInboxHealth (single)
+ *   POST /campaigns/{id}/leads             → uploadLeads (Stage 20)
+ *   GET  /campaigns/{id}/leads             → getCampaignLeads (Stage 21A)
+ *                                          → getCampaignLeadDetail (Stage 21B discovery)
  *
  * ── Retry / resilience ────────────────────────────────────────────────────────
  *   429 → read Retry-After header, sleep, retry once, then throw OutreachRateLimitError
@@ -38,11 +39,15 @@ import {
 } from "./errors.js";
 import type {
   CampaignHealthResult,
+  CampaignLeadDetail,
+  CampaignLeadRecord,
   DomainHealthResult,
   DomainReputationTier,
   InboxHealthResult,
   InboxSummary,
   OutreachProvider,
+  UploadLeadInput,
+  UploadLeadsResult,
 } from "./types.js";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -59,6 +64,53 @@ export interface SmartleadCredentials {
 }
 
 // ── Internal API response shapes ──────────────────────────────────────────────
+
+interface SmartleadUploadResponse {
+  upload_count?:               number;
+  /** Leads blocked by global suppression/unsubscribe lists — not the same as per-campaign dedup. */
+  duplicate_count?:            number;
+  /** Leads already present in THIS campaign — the authoritative per-campaign dedup counter. */
+  already_added_to_campaign?:  number;
+}
+
+/**
+ * Response envelope for GET /campaigns/{id}/leads (confirmed 2026-09-05):
+ *   { total_leads: "1", data: [...], offset: 0, limit: 100 }
+ * total_leads is a STRING, not a number.
+ * data is the lead array; absent fields default to empty array.
+ */
+interface SmartleadGetLeadsResponse {
+  total_leads?: string | number;
+  data?:        SmartleadCampaignLeadRaw[];
+  offset?:      number;
+  limit?:       number;
+}
+
+interface SmartleadCampaignLeadRaw {
+  /** Per-(campaign, lead) junction key — the authoritative platform_lead_id. */
+  campaign_lead_map_id?: string | number;
+  lead_category_id?:     string | number | null;
+  status?:               string;
+  created_at?:           string;
+  // Engagement fields — confirmed absent for DRAFTED campaigns (status=STARTED).
+  // Expected to appear once the campaign goes active (Stage 21B contract TBD).
+  sent_at?:              string | null;
+  replied_at?:           string | null;
+  bounced_at?:           string | null;
+  unsubscribed_at?:      string | null;
+  reply_type?:           string | null;
+  lead?: {
+    id?:                 number;
+    /** Raw email from Smartlead. Normalize (lowercase + trim) before using as match key. */
+    email?:              string;
+    first_name?:         string;
+    last_name?:          string;
+    company_name?:       string;
+    is_unsubscribed?:    boolean;
+    [key: string]:       unknown;
+  };
+  [key: string]: unknown;
+}
 
 interface SmartleadCampaignAnalytics {
   sent_count?: number;
@@ -240,7 +292,181 @@ export class SmartleadAdapter implements OutreachProvider {
     return toInboxHealthResult(raw);
   }
 
+  /**
+   * Upload up to 100 leads to a Smartlead campaign.
+   *
+   * Uses ?ignore_duplicate=true so Smartlead silently accepts leads it already
+   * knows about — duplicate_count in the response reflects those; they are not
+   * treated as errors. platform_lead_id is NOT populated because Smartlead's
+   * upload response does not return a per-lead identifier.
+   *
+   * The caller (lead-upload.ts) is responsible for batching to ≤ 100 leads.
+   * This method enforces the cap defensively and processes only the first 100.
+   *
+   * SECURITY: The request URL contains the API key as a query param. It must
+   * never be logged. This method ensures no thrown error includes the URL or key.
+   *
+   * ── Duplicate handling ─────────────────────────────────────────────────────
+   * Smartlead accepts re-uploads of existing leads without error (HTTP 200).
+   * The `already_added_to_campaign` field in the response is the authoritative
+   * per-campaign dedup counter. `duplicate_count` is a separate global-list
+   * counter (suppression/unsubscribe). We map `already_added_to_campaign` to
+   * our internal `duplicateCount` with `duplicate_count` as fallback for
+   * response shapes that predate this field.
+   *
+   * Note: `ignore_duplicate` is NOT a valid Smartlead API query parameter
+   * (confirmed empirically — HTTP 400 if included). Smartlead handles dedup
+   * natively; no extra parameter is required.
+   */
+  async uploadLeads(
+    platformCampaignId: string,
+    leads: UploadLeadInput[],
+  ): Promise<UploadLeadsResult> {
+    if (!this.isConfigured()) throw new OutreachCredentialError("smartlead");
+    if (leads.length === 0) return { uploadCount: 0, duplicateCount: 0 };
+
+    const batch = leads.slice(0, INBOX_PAGE_SIZE); // defensive 100-lead cap
+    const path = `${API_BASE}/campaigns/${encodeURIComponent(platformCampaignId)}/leads`;
+    const body = JSON.stringify({
+      lead_list: batch.map((l) => ({
+        email:         l.email,
+        first_name:    l.firstName,
+        last_name:     l.lastName,
+        company_name:  l.companyName,
+        custom_fields: l.customFields ?? {},
+      })),
+    });
+
+    const raw = await this._post<SmartleadUploadResponse>(
+      path,
+      platformCampaignId,
+      "campaign-leads",
+      body,
+    );
+
+    return {
+      uploadCount:    raw.upload_count ?? 0,
+      // already_added_to_campaign is the per-campaign dedup counter;
+      // fall back to duplicate_count for older response shapes.
+      duplicateCount: raw.already_added_to_campaign ?? raw.duplicate_count ?? 0,
+    };
+  }
+
+  /**
+   * Retrieve all leads enrolled in a Smartlead campaign.
+   * Paginates using offset/limit (100 per page) until a partial page is received.
+   *
+   * Response envelope: { total_leads: string, data: [...], offset, limit }
+   * Per-lead shape:    { campaign_lead_map_id, status, created_at, lead: { email, ... } }
+   *
+   * Items missing campaign_lead_map_id or lead.email are silently skipped — they
+   * cannot be matched back to our contacts and have no usable platform_lead_id.
+   *
+   * Returned emails are normalized (lowercase, trimmed) for case-insensitive matching.
+   * campaign_lead_map_id is coerced to string even if Smartlead returns a number.
+   *
+   * SECURITY: The request URL contains the API key — never log it.
+   */
+  async getCampaignLeads(platformCampaignId: string): Promise<CampaignLeadRecord[]> {
+    if (!this.isConfigured()) throw new OutreachCredentialError("smartlead");
+
+    const all: CampaignLeadRecord[] = [];
+    let offset = 0;
+
+    while (true) {
+      const path = `${API_BASE}/campaigns/${encodeURIComponent(platformCampaignId)}/leads?offset=${offset}&limit=${INBOX_PAGE_SIZE}`;
+      const resp = await this._get<SmartleadGetLeadsResponse>(
+        path,
+        platformCampaignId,
+        "campaign-leads",
+      );
+
+      const batch: SmartleadCampaignLeadRaw[] = Array.isArray(resp.data) ? resp.data : [];
+
+      for (const item of batch) {
+        const mapId = item.campaign_lead_map_id;
+        const email = item.lead?.email;
+
+        // Skip items that can't be matched or tracked
+        if (mapId == null || mapId === "" || !email || !email.trim()) continue;
+
+        all.push({
+          campaignLeadMapId: String(mapId),
+          email:             email.toLowerCase().trim(),
+          smartleadStatus:   item.status ?? "",
+        });
+      }
+
+      // Stop when a partial page is received — no more data
+      if (batch.length < INBOX_PAGE_SIZE) break;
+      offset += INBOX_PAGE_SIZE;
+    }
+
+    return all;
+  }
+
+  /**
+   * Retrieve enriched detail for one lead in a campaign, matched by
+   * campaign_lead_map_id.  Paginates the full roster until found or exhausted.
+   * Returns null when no matching lead exists.
+   *
+   * rawFields in the returned object contains the full unprocessed Smartlead
+   * per-lead object — all fields including those not yet mapped to our schema.
+   * This is the primary instrument for Stage 21B field discovery.
+   *
+   * GET only — no mutations.
+   */
+  async getCampaignLeadDetail(
+    platformCampaignId: string,
+    campaignLeadMapId:  string,
+  ): Promise<CampaignLeadDetail | null> {
+    if (!this.isConfigured()) throw new OutreachCredentialError("smartlead");
+
+    let offset = 0;
+    while (true) {
+      const path = `${API_BASE}/campaigns/${encodeURIComponent(platformCampaignId)}/leads?offset=${offset}&limit=${INBOX_PAGE_SIZE}`;
+      const resp = await this._get<SmartleadGetLeadsResponse>(
+        path,
+        platformCampaignId,
+        "campaign-leads",
+      );
+
+      const batch: SmartleadCampaignLeadRaw[] = Array.isArray(resp.data) ? resp.data : [];
+
+      for (const item of batch) {
+        const mapId = item.campaign_lead_map_id;
+        if (mapId == null || mapId === "") continue;
+        if (String(mapId) === campaignLeadMapId) {
+          return this._rawToDetail(item);
+        }
+      }
+
+      if (batch.length < INBOX_PAGE_SIZE) return null;
+      offset += INBOX_PAGE_SIZE;
+    }
+  }
+
   // ── Internal helpers ────────────────────────────────────────────────────────
+
+  private _rawToDetail(item: SmartleadCampaignLeadRaw): CampaignLeadDetail {
+    const mapId = item.campaign_lead_map_id;
+    const email  = item.lead?.email ?? "";
+    return {
+      campaignLeadMapId: String(mapId ?? ""),
+      email:             email.toLowerCase().trim(),
+      smartleadStatus:   item.status ?? "",
+      leadId:            item.lead?.id != null ? String(item.lead.id) : null,
+      leadCategoryId:    item.lead_category_id != null ? String(item.lead_category_id) : null,
+      createdAt:         item.created_at ?? null,
+      isUnsubscribed:    !!item.lead?.is_unsubscribed,
+      sentAt:            item.sent_at ?? null,
+      repliedAt:         item.replied_at ?? null,
+      bouncedAt:         item.bounced_at ?? null,
+      unsubscribedAt:    item.unsubscribed_at ?? null,
+      replyType:         item.reply_type ?? null,
+      rawFields:         { ...item },
+    };
+  }
 
   private _url(path: string): string {
     const sep = path.includes("?") ? "&" : "?";
@@ -310,6 +536,108 @@ export class SmartleadAdapter implements OutreachProvider {
         const body = await resp.text().catch(() => "");
         throw new OutreachProviderError(
           `smartlead: unexpected HTTP ${resp.status}: ${body.slice(0, 200)}`,
+          "smartlead",
+        );
+      }
+
+      let json: unknown;
+      try {
+        json = await resp.json();
+      } catch {
+        throw new OutreachMalformedResponseError("smartlead", "response is not valid JSON");
+      }
+
+      if (json === null || typeof json !== "object") {
+        throw new OutreachMalformedResponseError(
+          "smartlead",
+          `expected object, got ${typeof json}`,
+        );
+      }
+
+      return json as T;
+    }
+
+    throw lastError instanceof OutreachProviderError
+      ? lastError
+      : new OutreachProviderError(
+          `smartlead: request failed after ${MAX_RETRIES} attempts`,
+          "smartlead",
+          lastError,
+        );
+  }
+
+  /**
+   * Execute a POST request against the Smartlead API.
+   *
+   * Mirrors _get() but uses POST with a JSON body. The url parameter must not
+   * be logged — it contains the API key appended by _url(). Error messages
+   * are constructed from response bodies, never from the request URL.
+   */
+  private async _post<T>(
+    path: string,
+    resourceId: string,
+    resourceType: string,
+    body: string,
+  ): Promise<T> {
+    const url = this._url(path); // url contains api_key — never log it
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      let resp: Response;
+      try {
+        resp = await fetch(url, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+          signal:  AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        });
+      } catch (err) {
+        if (err instanceof Error && err.name === "TimeoutError") {
+          throw new OutreachTimeoutError("smartlead");
+        }
+        lastError = err;
+        continue;
+      }
+
+      if (resp.status === 401 || resp.status === 403) {
+        const apiMsg = await resp.text().catch(() => "");
+        let detail = "";
+        try {
+          const parsed = JSON.parse(apiMsg) as Record<string, unknown>;
+          detail = typeof parsed.message === "string" ? parsed.message : apiMsg;
+        } catch {
+          detail = apiMsg;
+        }
+        throw new OutreachCredentialError("smartlead", detail.slice(0, 120) || undefined);
+      }
+
+      if (resp.status === 404) {
+        throw new OutreachNotFoundError("smartlead", resourceType, resourceId);
+      }
+
+      if (resp.status === 429) {
+        const retryAfter = Number(resp.headers.get("Retry-After") ?? "5") * 1000;
+        if (attempt === 0) {
+          await sleep(retryAfter);
+          continue;
+        }
+        throw new OutreachRateLimitError("smartlead", retryAfter);
+      }
+
+      if (resp.status >= 500) {
+        const backoff = 1000 * 2 ** attempt;
+        await sleep(backoff);
+        lastError = new OutreachProviderError(
+          `smartlead: server error ${resp.status}`,
+          "smartlead",
+        );
+        continue;
+      }
+
+      if (!resp.ok) {
+        const respBody = await resp.text().catch(() => "");
+        throw new OutreachProviderError(
+          `smartlead: unexpected HTTP ${resp.status}: ${respBody.slice(0, 200)}`,
           "smartlead",
         );
       }

@@ -18,6 +18,7 @@
  */
 
 import type { OpportunityScoreResult } from "../lib/opportunity-scoring";
+import type { WhyNowAssessment } from "../domain/signal-types";
 import { getSupabaseAdmin } from "./supabase";
 
 const TABLE = "account_intelligence";
@@ -57,6 +58,25 @@ export interface AccountIntelligenceRow {
    * Null when priorityScore is null.
    */
   prioritizedAt: string | null;
+  /**
+   * Full Why Now assessment — deterministic evidence + readiness gate + AI narrative.
+   * Stage 22. Null until the first assessWhyNow() run for this (client, company) pair.
+   * INITIAL_HYPOTHESIS_NOT_VALIDATED — readiness thresholds are unvalidated hypotheses.
+   */
+  whyNow: WhyNowAssessment | null;
+  /**
+   * True when the account passes the deterministic readiness gate.
+   * Promoted from why_now->ready to enable fast indexed filtering.
+   * Null until the first Stage 22 run. False = assessed but not ready.
+   * INITIAL_HYPOTHESIS_NOT_VALIDATED.
+   */
+  isReady: boolean | null;
+  /**
+   * When the readiness gate was last evaluated.
+   * NOT a freshness guarantee — new signals may have changed readiness since.
+   * Null when isReady is null (not yet assessed).
+   */
+  readinessAssessedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -112,6 +132,9 @@ export function fromAccountIntelligenceRow(
     scoreInputs:               (row.score_inputs as OpportunityScoreResult | null) ?? null,
     priorityScore:             (row.priority_score as number | null) ?? null,
     prioritizedAt:             (row.prioritized_at as string | null) ?? null,
+    whyNow:                    (row.why_now as WhyNowAssessment | null) ?? null,
+    isReady:                   (row.is_ready as boolean | null) ?? null,
+    readinessAssessedAt:       (row.readiness_assessed_at as string | null) ?? null,
     createdAt:                 row.created_at as string,
     updatedAt:                 row.updated_at as string,
   };
@@ -423,6 +446,92 @@ export async function getRankedAccounts(
   }
 
   return buildRankedEntries(aiRows, companyMap);
+}
+
+// ── Why Now persistence — Stage 22 ───────────────────────────────────────────
+
+/**
+ * Write the Why Now assessment to account_intelligence.
+ *
+ * Updates three columns atomically:
+ *   why_now               — the full WhyNowAssessment JSONB
+ *   is_ready              — promoted from assessment.ready for fast filtering
+ *   readiness_assessed_at — the calculation timestamp (not a freshness guarantee)
+ *
+ * This is a targeted UPDATE — it does NOT touch opportunity_score, score_inputs,
+ * priority_score, or any other column. The Stage 12/13 and Stage 14 columns are
+ * owned by their respective tasks.
+ *
+ * The row is guaranteed to exist: assessWhyNow() only calls this function when
+ * an account_intelligence row was found. Throws if the UPDATE finds no matching row
+ * (defensive guard for unexpected state).
+ *
+ * Client isolation: both .eq('client_id') and .eq('company_id') are required —
+ * the WHERE clause always scopes to a single (client, company) pair.
+ *
+ * @param now  The wall-clock time for readiness_assessed_at and updated_at.
+ */
+export async function setWhyNow(
+  clientId: string,
+  companyId: string,
+  assessment: WhyNowAssessment,
+  now: Date = new Date(),
+): Promise<void> {
+  const { data, error } = await getSupabaseAdmin()
+    .from(TABLE)
+    .update({
+      why_now:               assessment,
+      is_ready:              assessment.ready,
+      readiness_assessed_at: now.toISOString(),
+      updated_at:            now.toISOString(),
+    })
+    .eq("client_id", clientId)
+    .eq("company_id", companyId)
+    .select("id")
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`setWhyNow failed: ${error.message}`);
+  }
+  if (!data) {
+    throw new Error(
+      `setWhyNow found no row for client=${clientId} company=${companyId}. ` +
+      "Run signal ingestion first to create the account_intelligence row.",
+    );
+  }
+}
+
+/**
+ * Fetch ready accounts for a client, ordered by priority_score DESC.
+ *
+ * Uses the account_intelligence_ready_priority_idx covering index
+ * (partial index on is_ready=true).
+ *
+ * Returns accounts where is_ready=true. Accounts not yet assessed (is_ready IS NULL)
+ * and non-ready accounts (is_ready=false) are excluded.
+ *
+ * Client isolation: scoped to clientId. No cross-client access.
+ *
+ * @param opts.limit  Maximum rows to return. Defaults to 50.
+ */
+export async function getReadyAccounts(
+  clientId: string,
+  opts: { limit?: number } = {},
+): Promise<AccountIntelligenceRow[]> {
+  const limit = opts.limit ?? 50;
+
+  const { data, error } = await getSupabaseAdmin()
+    .from(TABLE)
+    .select("*")
+    .eq("client_id", clientId)
+    .eq("is_ready", true)
+    .order("priority_score", { ascending: false, nullsFirst: false })
+    .limit(limit);
+
+  if (error) {
+    throw new Error(`getReadyAccounts failed: ${error.message}`);
+  }
+  return (data as Record<string, unknown>[]).map(fromAccountIntelligenceRow);
 }
 
 // ── Priority score persistence — Stage 14 ────────────────────────────────────

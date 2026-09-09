@@ -49,7 +49,7 @@ All tables have RLS enabled via `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`. How
 | enrichment_runs | Yes (0007+) | service_role grants only | No |
 | jobs | Yes (in code) | service_role grants only | No |
 | campaigns | Unknown (pre-migration) | None | No |
-| campaign_leads | Unknown (pre-migration) | None | No |
+| campaign_leads | **Yes (confirmed live)** | **None (FINDING 6)** | No (service_role bypasses; default-deny for JWT callers) |
 
 ### FINDING 1: signals table had no `ENABLE ROW LEVEL SECURITY` — RESOLVED
 
@@ -116,6 +116,23 @@ ALTER TABLE public.signals ENABLE ROW LEVEL SECURITY;
 
 ## Multi-Tenant Isolation
 
+### FINDING 5: lists and list_members have no client_id — UNRESOLVED
+
+**PROBLEM:** The `lists` and `list_members` tables have no `client_id` column. `campaigns.list_id` can reference any list regardless of which client built it. There is no DB-level guarantee that a campaign's `list_id` references a list built for the same client.
+
+**WHY IT MATTERS:** A campaign for client A could be pointed at a list built for client B. Contacts in that list would then be assessed for enrollment under client A's campaign. The only application-layer mitigation is Gate 1 (account intelligence, which IS `client_id`-scoped): a contact whose company has no account intelligence record for client A fails Gate 1 and is marked ineligible. This is a soft filter, not a hard DB-level block.
+
+**CURRENT STATE:** Actively open. `LeadSupplyReport.listClientWarning` (Stage 19A) documents this gap in every report where `listId` is non-null. The warning text reads:
+> "FINDING 5 (25-SUPABASE-SECURITY.md): lists and list_members have no client_id. There is no DB-level guarantee that this list was built for this client. Cross-client contacts fail at Gate 1 (NO_ACCOUNT_INTELLIGENCE) unless the company appears in both clients' account_intelligence. This warning is documentation of the unresolved isolation gap — not a security fix."
+
+**RECOMMENDED FIX (not yet approved):** Add `client_id uuid NOT NULL FK → clients(id)` to `lists` and `list_members`, and add a composite FK `(client_id, list_id) → lists(client_id, id)` on `campaigns`. This would enforce tenant isolation at the DB level.
+
+**WHAT COULD BREAK:** Any existing rows in `lists` or `list_members` would need backfilling. The `campaigns.list_id` FK would become a composite FK, which requires a migration and coordination with any application code that sets `list_id`.
+
+> **STATUS: UNRESOLVED.** Do not apply any fix without explicit user approval and a new migration. FINDING 5 must remain explicitly open until resolved.
+
+---
+
 ### FINDING 3: Tenant isolation is code-level, not database-level
 
 **PROBLEM:** All client data (Gramscode, future clients) lives in the same tables. Isolation is enforced by including `client_id` in every query's WHERE clause. There are no database-level policies preventing one client's data from appearing in another client's query if a `client_id` filter is accidentally omitted.
@@ -141,6 +158,33 @@ ALTER TABLE public.signals ENABLE ROW LEVEL SECURITY;
 | **Campaign content** | email_sequences, email_sequence_steps | Medium — email copy and targeting data |
 | **Internal operational data** | jobs, enrichment_runs | Low — no PII, operational metadata only |
 | **Configuration data** | clients, icp_onboarding, lead_magnets | Medium — client business information |
+
+---
+
+---
+
+### FINDING 6: campaign_leads has RLS enabled but zero policies — UNRESOLVED
+
+**PROBLEM:** Live inspection confirms `campaign_leads` has `rls_enabled = true` but zero policies are defined. PostgreSQL's default-deny applies: any non-service-role query returns zero rows.
+
+**WHY IT MATTERS:** Two risks:
+1. **Silent data invisibility:** If any future code path authenticates with a JWT (not service_role), all `campaign_leads` queries return empty silently — no error, just no data. This could mask enrollment data and cause incorrect "no leads enrolled" results.
+2. **No tenant filter policy:** Even when policies are added in the future, a cross-client SELECT policy must be carefully written. Without it, a permissive `FOR ALL TO authenticated USING (true)` would expose all clients' enrollment data.
+
+**CURRENT STATE:** Currently harmless — all app queries use service_role which bypasses RLS. But the table is effectively unprotected if the authentication model ever changes.
+
+The RLS status table above showed `campaign_leads` as "Unknown (pre-migration)" — the live inspection confirms it is `rls_enabled = true`, `force_rls = false`, zero policies.
+
+**RECOMMENDED FIX (not yet approved):** Add a `client_id`-scoped SELECT policy consistent with other tables, e.g.:
+```sql
+CREATE POLICY "clients see own campaign_leads"
+  ON public.campaign_leads FOR ALL TO authenticated
+  USING (client_id = auth.jwt()->'app_metadata'->>'client_id');
+```
+
+**WHAT COULD BREAK:** Nothing currently — no JWT-authenticated queries exist. Adding the policy is safe for the current service_role architecture. Required before any user-facing JWT flow touches campaign_leads.
+
+> **STATUS: UNRESOLVED.** Documentation only. Do not apply any policy without explicit user approval.
 
 ---
 
@@ -176,8 +220,8 @@ If `SUPABASE_SERVICE_ROLE_KEY` were exposed:
 |------|--------|
 | API key handling | Good — env vars, gitignored |
 | No anon key in use | Good — backend-only system |
-| RLS enabled | Good — all 21 tables now have RLS enabled (FINDING 1 resolved in Stage 16) |
-| Tenant isolation | Good — code-level, confirmed by integration test |
+| RLS enabled | Good — all tables have RLS enabled; FINDING 6: campaign_leads has no policies (latent, not actively exploitable) |
+| Tenant isolation | Partial — code-level for most tables; FINDING 5: lists/list_members have no client_id (open isolation gap) |
 | Data in transit | Good — Supabase API is HTTPS only |
 | Secret logging | Good — no logging of credentials found |
 | Cascade deletes | Risk — client deletion cascades to all data; no soft-delete |
