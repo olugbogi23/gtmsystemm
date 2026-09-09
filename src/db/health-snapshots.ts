@@ -328,6 +328,39 @@ export async function getBaselineDomainSnapshot(
   return fromDomainSnapshotRow(data as Record<string, unknown>);
 }
 
+/**
+ * Returns the latest domain health snapshot for each domain of a given provider.
+ * Used by Stage 25 to aggregate healthy inbox counts without knowing individual domains.
+ *
+ * Implementation: fetches recent rows ordered by taken_at DESC, deduplicates by domain
+ * (first occurrence = most recent). Limit 500 covers up to 500 domain entries per provider.
+ */
+export async function getLatestDomainSnapshotsByProvider(
+  clientId: string,
+  provider: string,
+): Promise<DomainHealthSnapshot[]> {
+  const { data, error } = await getSupabaseAdmin()
+    .from(DOMAIN_TABLE)
+    .select("*")
+    .eq("client_id", clientId)
+    .eq("provider",  provider)
+    .order("taken_at", { ascending: false })
+    .limit(500);
+
+  if (error) throw new Error(`getLatestDomainSnapshotsByProvider failed: ${error.message}`);
+
+  const seen = new Set<string>();
+  const results: DomainHealthSnapshot[] = [];
+  for (const row of (data as Record<string, unknown>[])) {
+    const snap = fromDomainSnapshotRow(row);
+    if (!seen.has(snap.domain)) {
+      seen.add(snap.domain);
+      results.push(snap);
+    }
+  }
+  return results;
+}
+
 /** Returns the most recent domain snapshot, or null. */
 export async function getLatestDomainSnapshot(
   clientId: string,
